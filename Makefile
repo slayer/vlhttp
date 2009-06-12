@@ -1,6 +1,7 @@
 
 linux:
-	gcc -O -W -Wall -o elhttp elhttp.c
+	$(CC) -O -W -Wall -c -I liblog -o log.o liblog/log.c
+	$(CC) -O -W -Wall -o elhttp log.o elhttp.c
 	strip elhttp
 
 sunos:

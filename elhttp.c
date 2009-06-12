@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include "liblog/log.h"
 
 #ifndef uint32
 #define uint32 unsigned long int
