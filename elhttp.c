@@ -363,6 +363,7 @@ void log_request( FILE *logfile, uint32 client_ip,
     shutdown( remote_fd, 2 );   \
     close( client_fd );         \
     close( remote_fd );         \
+	fprintf(td->logfile, "exit with %d code\n", ret); \
     return( ret );
 
 int client_thread( struct thread_data *td )
@@ -370,11 +371,12 @@ int client_thread( struct thread_data *td )
     int remote_fd = -1;
     int remote_port;
     int state, c_flag;
-    int n, client_fd;
+    int n, i, client_fd;
     uint32 client_ip;
 
-    char *str_end, c;
-    char *url_host, buffer[1024];
+	char logbuf[1024];
+    char *str_end, c, *pstr;
+    char *url_host, buffer[1024], http11_host[256];
     char *url_port, last_host[256];
 
     struct sockaddr_in remote_addr;
@@ -411,6 +413,23 @@ int client_thread( struct thread_data *td )
     {
         child_exit( 12 );
     }
+
+	snprintf(logbuf, n, "%s", buffer);
+	fprintf(td->logfile, "C: '%s', n=%d\n", logbuf, n);
+
+#if 1
+	if (pstr = strstr(buffer, "\nHost: ")) {
+		pstr += 7;
+		i = 0;
+		while (*pstr != '\r' && *pstr != '\n' )
+			http11_host[i++] = *(pstr++);
+		http11_host[i] = '\0';
+		fprintf(td->logfile, "- Host option found: '%s'\n", http11_host);
+	} else {
+		fprintf(td->logfile, "- Host option not found\n");
+		http11_host[0] = '\0';
+	}
+#endif
 
     memset( last_host, 0, sizeof( last_host ) );
 
@@ -482,7 +501,7 @@ process_request:
 
     str_end = url_host;
 
-    while( *str_end != ':' && *str_end != '/' )
+    while( *str_end != ':' && *str_end != '/' && *str_end != ' ' )
     {
         if( ( str_end - url_host ) >= 128 ||
              *str_end == '\0' )
@@ -496,7 +515,8 @@ process_request:
     c = *str_end;
     *str_end = '\0';
 
-    if( ! ( remote_host = gethostbyname( url_host ) ) )
+
+    if( ! ( remote_host = gethostbyname( http11_host[0] ? http11_host : url_host ) ) )
     {
         child_exit( 17 );
     }
@@ -542,6 +562,8 @@ process_request:
             child_exit( 20 );
         }
     }
+
+	fprintf(td->logfile, "- url_host: '%s'\n", url_host);
 
     /* connect to the remote server, if not already connected */
 
@@ -598,6 +620,10 @@ process_request:
     {
         int m_len; /* method string length + 1 */
 
+#if 0
+		snprintf(logbuf, n, "BUFFER NOW: '%s', n=%d\n", buffer, n);
+		fprintf(td->logfile, "%s", logbuf);
+
         /* remove "http://hostname[:port]" & send headers */
 
         m_len = url_host - 7 - buffer;
@@ -605,8 +631,12 @@ process_request:
         n -= 7 + ( str_end - url_host );
 
         memcpy( str_end -= m_len, buffer, m_len );
+#endif
 
-        if( send( remote_fd, str_end, n, 0 ) != n )
+		snprintf(logbuf, n, "%s", buffer);
+		fprintf(td->logfile, "> '%s', n=%d\n", logbuf, n);
+
+        if( send( remote_fd, buffer, n, 0 ) != n )
         {
             child_exit( 24 );
         }
@@ -635,6 +665,8 @@ process_request:
             {
                 child_exit( 26 );
             }
+			snprintf(logbuf, n, "%s", buffer);
+			fprintf(td->logfile, "RECV: '%s', n=%d\n", logbuf, n);
 
             state = 1; /* client finished sending data */
 
@@ -642,6 +674,8 @@ process_request:
             {
                 child_exit( 27 );
             }
+			snprintf(logbuf, n, "%s", buffer);
+			fprintf(td->logfile, "SEND: '%s', n=%d\n", logbuf, n);
         }
 
         if( FD_ISSET( client_fd, &rfds ) )
