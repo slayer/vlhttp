@@ -50,6 +50,8 @@
 #define uint32 unsigned long int
 #endif
 
+#define LIBLOG_ENABLED
+
 struct thread_data
 {
     int client_fd;
@@ -61,8 +63,10 @@ struct thread_data
 };
 
 int client_thread( struct thread_data *td );
+int done(int result);
 
 #ifndef WIN32
+
 
 int main( int argc, char *argv[] )
 {
@@ -84,29 +88,32 @@ int main( int argc, char *argv[] )
     td.auth_ip &= td.netmask;
     td.client_ip = 0;
 
+	LOG_INIT;
+	LOG_SET_FILE(td.logfile);
+
     /* is inetd mode enabled ? */
 
     if( proxy_port == 0 )
     {
         td.client_fd = 0; /* stdin */
 
-        return( client_thread( &td ) );
+        done( client_thread( &td ) );
     }
 
     /* fork into background */
 
     if( ( pid = fork() ) < 0 )
     {
-        return( 2 );
+        done( 2 );
     }
 
-    if( pid ) return( 0 );
+    if( pid ) done( 0 );
 
     /* create a new session */
 
     if( setsid() < 0 )
     {
-        return( 3 );
+        done( 3 );
     }
 
     /* close all file descriptors */
@@ -149,6 +156,8 @@ int main( int argc, char *argv[] )
     td.logfile = ( argc > 4 ) ? fopen( argv[4], "a+" ) : NULL;
     td.connect = ( argc > 5 ) ?        atoi( argv[5] ) :    1;
 
+	LOG_INIT;
+	LOG_SET_FILE(td.logfile);
     td.auth_ip &= td.netmask;
     td.client_ip = 0;
 
@@ -160,7 +169,7 @@ int main( int argc, char *argv[] )
 
     if( proxy_fd < 0 )
     {
-        return( 4 );
+        done( 4 );
     }
 
     /* bind the proxy on the local port and listen */
@@ -172,7 +181,7 @@ int main( int argc, char *argv[] )
     if( setsockopt( proxy_fd, SOL_SOCKET, SO_REUSEADDR,
                     (void *) &n, sizeof( n ) ) < 0 )
     {
-        return( 5 );
+        done( 5 );
     }
 
 #endif
@@ -184,12 +193,12 @@ int main( int argc, char *argv[] )
     if( bind( proxy_fd, (struct sockaddr *) &proxy_addr,
               sizeof( proxy_addr ) ) < 0 )
     {
-        return( 6 );
+        done( 6 );
     }
 
     if( listen( proxy_fd, 10 ) != 0 )
     {
-        return( 7 );
+        done( 7 );
     }
 
     while( 1 )
@@ -201,7 +210,7 @@ int main( int argc, char *argv[] )
         if( ( td.client_fd = accept( proxy_fd,
                 (struct sockaddr *) &client_addr, &n ) ) < 0 )
         {
-            return( 8 );
+            done( 8 );
         }
 
         td.client_ip = client_addr.sin_addr.s_addr;
@@ -237,12 +246,12 @@ int main( int argc, char *argv[] )
 
         if( ( pid = fork() ) < 0 )
         {
-            return( 9 );
+            done( 9 );
         }
 
-        if( pid ) return( 0 );
+        if( pid ) done( 0 );
 
-        return( client_thread( &td ) );
+        done( client_thread( &td ) );
 
 #else
 
@@ -261,7 +270,7 @@ int main( int argc, char *argv[] )
 
     /* not reached */
 
-    return( -1 );
+    done( -1 );
 }
 
 void log_request( FILE *logfile, uint32 client_ip,
@@ -703,4 +712,12 @@ process_request:
     /* not reached */
 
     return( -1 );
+}
+
+int done(int result)
+{
+	DBG("exit with %d code", result);
+	LOG_DONE;
+	exit(result);
+	return result;
 }
