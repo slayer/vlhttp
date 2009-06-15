@@ -18,6 +18,7 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#define _GNU_SOURCE
 #ifndef WIN32
 
 #include <sys/types.h>
@@ -50,7 +51,14 @@
 #define uint32 unsigned long int
 #endif
 
-#define LIBLOG_ENABLED
+#ifndef MIN
+#define MIN(a, b)  (((a) < (b)) ? (a) : (b))
+#endif /* MIN */
+#define CR '\r'
+#define LF '\n'
+#define CRLF "\r\n"
+
+
 
 struct thread_data
 {
@@ -63,7 +71,12 @@ struct thread_data
 };
 
 int client_thread( struct thread_data *td );
-int done(int result);
+
+#define done(result) \
+	DBG("exit with %d code", result); \
+	LOG_DONE; \
+	return result; \
+
 
 #ifndef WIN32
 
@@ -88,18 +101,23 @@ int main( int argc, char *argv[] )
     td.auth_ip &= td.netmask;
     td.client_ip = 0;
 
-	LOG_INIT;
-	LOG_SET_FILE(td.logfile);
+	LOG_INIT("/tmp/vlhttp-debug.log");
 
     /* is inetd mode enabled ? */
 
     if( proxy_port == 0 )
     {
+		int r;
         td.client_fd = 0; /* stdin */
 
-        done( client_thread( &td ) );
+		DBG("start",0);
+		r = client_thread( &td );
+		DBG("exit with %d code", r);
+
+        return( r );
     }
 
+#if 0
     /* fork into background */
 
     if( ( pid = fork() ) < 0 )
@@ -107,7 +125,7 @@ int main( int argc, char *argv[] )
         done( 2 );
     }
 
-    if( pid ) done( 0 );
+    if( pid ) return ( 0 );
 
     /* create a new session */
 
@@ -123,6 +141,8 @@ int main( int argc, char *argv[] )
         close( n );
     }
 
+    td.logfile = ( argc > 4 ) ? fopen( argv[4], "a+" ) : NULL;
+#endif
 #else
 
 HANDLE tdSem;
@@ -156,8 +176,7 @@ int main( int argc, char *argv[] )
     td.logfile = ( argc > 4 ) ? fopen( argv[4], "a+" ) : NULL;
     td.connect = ( argc > 5 ) ?        atoi( argv[5] ) :    1;
 
-	LOG_INIT;
-	LOG_SET_FILE(td.logfile);
+	LOG_INIT("vlhttp-debug.log");
     td.auth_ip &= td.netmask;
     td.client_ip = 0;
 
@@ -208,7 +227,7 @@ int main( int argc, char *argv[] )
         /* wait for inboud connections */
 
         if( ( td.client_fd = accept( proxy_fd,
-                (struct sockaddr *) &client_addr, &n ) ) < 0 )
+                (struct sockaddr *) &client_addr, (socklen_t*)&n ) ) < 0 )
         {
             done( 8 );
         }
@@ -249,9 +268,9 @@ int main( int argc, char *argv[] )
             done( 9 );
         }
 
-        if( pid ) done( 0 );
+        if( pid ) return ( 0 );
 
-        done( client_thread( &td ) );
+        return( client_thread( &td ) );
 
 #else
 
@@ -368,32 +387,77 @@ void log_request( FILE *logfile, uint32 client_ip,
     fflush( logfile );
 }
 
-#define child_exit(ret)         \
-    shutdown( client_fd, 2 );   \
-    shutdown( remote_fd, 2 );   \
-    close( client_fd );         \
-    close( remote_fd );         \
-	fprintf(td->logfile, "exit with %d code\n", ret); \
-    return( ret );
+void bad_request(struct thread_data *td )
+{
+	char message[]="<html><body><h1>Bad request</h1></body><html>";
+	DBG("send: '%s'", message);
+	send( td->client_fd, message, sizeof(message), 0 );
+}
+
+char* get_header(const char* header, const char* headers)
+{
+	char *s;
+	char headname[256];
+	char *result = NULL;
+	char *start = NULL, *end = NULL;
+
+	snprintf(headname, sizeof(headname), "\n%s: ", header);
+	s = strstr(headers, headname);
+	if (s) {
+		start = s + strlen("\n: ") + strlen(headname); 
+		if ( (end = strchr(start, '\r')) || (end = strchr(start, '\n'))) 
+			result = strndup(start, end-start);
+	}
+
+	if ( result ) {
+		DBG("- HEADER found '%s': %s", header, result);
+	} else {
+		DBG("- HEADER '%s' not found", header);
+	}
+
+	return result;
+}
 
 int client_thread( struct thread_data *td )
 {
     int remote_fd = -1;
     int remote_port;
-    int state, c_flag;
-    int n, i, client_fd;
+    int state, c_flag=0;
+    int n, client_fd;
+	int result = -1;
     uint32 client_ip;
 
-	char logbuf[1024];
-    char *str_end, c, *pstr;
-    char *url_host, buffer[1024], http11_host[256];
-    char *url_port, last_host[256];
+#define BUF_SIZE 1024
+	char logbuf[BUF_SIZE];
+    char *str_end, c, *pstr, *white_space;
+    char buffer[BUF_SIZE];
+    char *url_port=NULL;
+	char last_host[256];
+
+	char method[16];
+	char http_proto_ver[16];
+	char scheme[16] = "http://";
+	char host[256];
+
+	char *url = malloc(BUF_SIZE);
+	char *request = malloc(BUF_SIZE);
+	char *url_host = malloc(BUF_SIZE);
+	char *url_req = malloc(BUF_SIZE);
+
+	char *http11_host = NULL;
+
 
     struct sockaddr_in remote_addr;
     struct hostent *remote_host;
     struct timeval timeout;
 
     fd_set rfds;
+
+	FENTER;
+	ASSERT(url);
+	ASSERT(request);
+	ASSERT(url_host);
+	ASSERT(url_req);
 
     client_fd = td->client_fd;
     client_ip = td->client_ip;
@@ -414,32 +478,22 @@ int client_thread( struct thread_data *td )
     timeout.tv_sec  = 10;
     timeout.tv_usec =  0;
 
-    if( select( client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0 )
-    {
-        child_exit( 11 );
+    if( select( client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0 ) {
+		WARN("select() timeout", 0);
+		result = 11;
+        goto exit;
     }
         
-    if( ( n = recv( client_fd, buffer, 1023, 0 ) ) <= 0 )
-    {
-        child_exit( 12 );
+    if( ( n = recv( client_fd, buffer, sizeof(buffer)-1, 0 ) ) <= 0 ) {
+		WARN("recv() fail", 0);
+        result = 12;
+		goto exit;
     }
 
 	snprintf(logbuf, n, "%s", buffer);
-	fprintf(td->logfile, "C: '%s', n=%d\n", logbuf, n);
+	DBG("RC: '%s' n=%d", logbuf, n);
 
-#if 1
-	if (pstr = strstr(buffer, "\nHost: ")) {
-		pstr += 7;
-		i = 0;
-		while (*pstr != '\r' && *pstr != '\n' )
-			http11_host[i++] = *(pstr++);
-		http11_host[i] = '\0';
-		fprintf(td->logfile, "- Host option found: '%s'\n", http11_host);
-	} else {
-		fprintf(td->logfile, "- Host option not found\n");
-		http11_host[0] = '\0';
-	}
-#endif
+	http11_host = get_header("Host", buffer);
 
     memset( last_host, 0, sizeof( last_host ) );
 
@@ -447,6 +501,7 @@ process_request:
 
     buffer[n] = '\0';
 
+#if 0
     /* log the client request */
 
     if( td->logfile != NULL )
@@ -455,7 +510,9 @@ process_request:
     }
 
     /* obfuscated CONNECT method search */
+#endif
 
+#if 0
     c_flag = 0;
 
     if( buffer[0] == 'C' && buffer[4] == 'E' &&
@@ -465,47 +522,84 @@ process_request:
     {
         if( ! td->connect )
         {
-            child_exit( 13 );
+            result = 13 );
         }
 
         c_flag = 1;
     }
+#endif
 
-    /* skip the http method (GET, PUT, etc.) */
+	/* Parse method (GET, PUT, etc.) */
+	white_space = strchr(buffer, ' ');
+	if ( white_space ) {
+		snprintf(method, MIN(sizeof(method)-1, (unsigned int) (white_space-buffer)+1), buffer);
+		white_space[0] = '\0';
+	} else {
+		bad_request(td);
+		ASSERT(white_space);
+		result = 14;
+		goto exit;
+	}
+	DBG("-  method: '%s'", method);
 
-    url_host = buffer;
+	/* Parse URL */
+	pstr = white_space + 1;
+	white_space = strchr(pstr, ' ');
+	if ( white_space ) {
+		white_space[0] = '\0';
+		snprintf(url, BUF_SIZE, "%s", pstr);
+	} else {
+		bad_request(td);
+		ASSERT(white_space);
+		result = 15;
+		goto exit;
+	}
+	DBG("-  url: '%s'", url);
 
-    while( *url_host != ' ' )
-    {
-        if( ( url_host - buffer ) > 10 ||
-             *url_host == '\0' )
-        {
-            child_exit( 14 );
-        }
+	/* Parse HTTP ver */
+	pstr = white_space + 1;
+	white_space = strchr(pstr, CR);
+	if ( *pstr && white_space ) {
+		snprintf(http_proto_ver, MIN(sizeof(http_proto_ver)-1, (unsigned int) (white_space-pstr)+1), "%s", pstr);
+	} else {
+		WARN("bad request: '%s'", pstr);
+		bad_request(td);
+		result = 16;
+		goto exit;
+	}
+	DBG("-  http_proto_ver: '%s'", http_proto_ver);
 
-        url_host++;
-    }
+	/* Parse HTTP host */
+    url_host = url;
+	if ( http11_host ) {
+		snprintf(url_host, BUF_SIZE, "%s", http11_host);
+	} else {
+		if (strncmp(url, "http://", 7) == 0 ) {
+			snprintf(url_host, BUF_SIZE, "%s", url+7);
+			
 
-    url_host++;
+		} else {
+			WARN("Strange url without 'http://': '%s'", url);
+			url_host = url;
+		}
+	}
+	DBG("-  url_host: '%s'", url_host);
 
-    /* grab the http server hostname */
+	pstr = strchr(url_host, ':');
+	if ( pstr ) {
+		snprintf(host, MIN(sizeof(host), (unsigned int) (pstr-url_host)), "%s", url_host);
+		DBG("-  changed url_host: '%s'", url_host);
+		url_port = pstr;
+		if ((!url_port) || (!atoi(url_port))) {
+			WARN("Bad port: '%s'", url_port);
+			url_port = "80";
+		}
+	} else { 
+		url_port = "80";
+	}
+	DBG("-  host: '%s'", host);
+	DBG("-  url_port: '%s'", url_port);
 
-    if( ! c_flag )
-    {
-        if( url_host[0] == 'h' && url_host[4] == ':' &&
-            url_host[1] == 't' && url_host[5] == '/' &&
-            url_host[2] == 't' && url_host[6] == '/' &&
-            url_host[3] == 'p' )
-        {
-            url_host += 7;
-        }
-        else
-        {
-            /* only http protocol is implemented */
-
-            child_exit( 15 );
-        }
-    }
 
     /* resolve the http server hostname */
 
@@ -516,7 +610,8 @@ process_request:
         if( ( str_end - url_host ) >= 128 ||
              *str_end == '\0' )
         {
-            child_exit( 16 );
+            result = 16;
+			goto exit;
         }
 
         str_end++;
@@ -525,10 +620,10 @@ process_request:
     c = *str_end;
     *str_end = '\0';
 
-
-    if( ! ( remote_host = gethostbyname( http11_host[0] ? http11_host : url_host ) ) )
-    {
-        child_exit( 17 );
+	DBG("-  Remote host: '%s':%d", url_host, url_port);
+    if( ! ( remote_host = gethostbyname( url_host ) ) ) {
+        result = 17;
+		goto exit;
     }
 
     *str_end = c;
@@ -547,16 +642,16 @@ process_request:
 
         while( *str_end != ' ' && *str_end != '/' )
         {
-            if( *str_end < '0' || *str_end > '9' )
-            {
-                child_exit( 18 );
+            if( *str_end < '0' || *str_end > '9' ) {
+                result = 18;
+				goto exit;
             }
 
             str_end++;
 
-            if( str_end - url_port > 5 )
-            {
-                child_exit( 19 );
+            if( str_end - url_port > 5 ) {
+                result = 19;
+				goto exit;
             }
         }
 
@@ -569,11 +664,12 @@ process_request:
     {
         if( td->connect == 1 && remote_port != 443 )
         {
-            child_exit( 20 );
+            result = 20;
+			goto exit;
         }
     }
 
-	fprintf(td->logfile, "- url_host: '%s'\n", url_host);
+	DBG("-  url_host: '%s'", url_host);
 
     /* connect to the remote server, if not already connected */
 
@@ -584,9 +680,9 @@ process_request:
 
         remote_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
 
-        if( remote_fd < 0 )
-        {
-            child_exit( 21 );
+        if( remote_fd < 0 ) {
+            result = 21;
+			goto exit;
         }
 
         remote_addr.sin_family = AF_INET;
@@ -599,7 +695,8 @@ process_request:
         if( connect( remote_fd, (struct sockaddr *) &remote_addr,
                      sizeof( remote_addr ) ) < 0 )
         {
-            child_exit( 22 );
+            result = 22;
+			goto exit;
         }
 
         memset( last_host, 0, sizeof( last_host ) );
@@ -623,12 +720,12 @@ process_request:
 
         if( send( client_fd, buffer, 19, 0 ) != 19 )
         {
-            child_exit( 23 );
+            result = 23;
+			goto exit;
         }
     }
     else
     {
-        int m_len; /* method string length + 1 */
 
 #if 0
 		snprintf(logbuf, n, "BUFFER NOW: '%s', n=%d\n", buffer, n);
@@ -646,9 +743,9 @@ process_request:
 		snprintf(logbuf, n, "%s", buffer);
 		fprintf(td->logfile, "> '%s', n=%d\n", logbuf, n);
 
-        if( send( remote_fd, buffer, n, 0 ) != n )
-        {
-            child_exit( 24 );
+        if( send( remote_fd, buffer, n, 0 ) != n ) {
+            result = 24;
+			goto exit;
         }
     }
 
@@ -666,33 +763,38 @@ process_request:
 
         if( select( n + 1, &rfds, NULL, NULL, NULL ) < 0 )
         {
-            child_exit( 25 );
+            result = 25;
+			goto exit;
         }
 
         if( FD_ISSET( remote_fd, &rfds ) )
         {
-            if( ( n = recv( remote_fd, buffer, 1023, 0 ) ) <= 0 )
-            {
-                child_exit( 26 );
+            if( ( n = recv( remote_fd, buffer, 1023, 0 ) ) <= 0 ) {
+                result = 26;
+				goto exit;
             }
+#if 0
 			snprintf(logbuf, n, "%s", buffer);
-			fprintf(td->logfile, "RECV: '%s', n=%d\n", logbuf, n);
+			DBG("RECV: '%s', n=%d\n", logbuf, n);
+#endif
 
             state = 1; /* client finished sending data */
 
-            if( send( client_fd, buffer, n, 0 ) != n )
-            {
-                child_exit( 27 );
+            if( send( client_fd, buffer, n, 0 ) != n ) {
+                result = 27;
+				goto exit;
             }
+#if 0
 			snprintf(logbuf, n, "%s", buffer);
 			fprintf(td->logfile, "SEND: '%s', n=%d\n", logbuf, n);
+#endif
         }
 
         if( FD_ISSET( client_fd, &rfds ) )
         {
-            if( ( n = recv( client_fd, buffer, 1023, 0 ) ) <= 0 )
-            {
-                child_exit( 28 );
+            if( ( n = recv( client_fd, buffer, 1023, 0 ) ) <= 0 ) {
+                result = 28;
+				goto exit;
             }
 
             if( state && ! c_flag )
@@ -702,22 +804,26 @@ process_request:
                 goto process_request;
             }
 
-            if( send( remote_fd, buffer, n, 0 ) != n )
-            {
-                child_exit( 29 );
+            if( send( remote_fd, buffer, n, 0 ) != n ) {
+                result = 29;
+				goto exit;
             }
         }
     }
 
     /* not reached */
+exit:
 
-    return( -1 );
+    shutdown( client_fd, 2 );
+    shutdown( remote_fd, 2 );
+    close( client_fd );
+    close( remote_fd );
+	if (url) free(url);
+	if (request) free(request);
+	if (url_host) free(url_host);
+	if (url_req) free(url_req);	
+	if (http11_host) free(http11_host);	
+	FLEAVEA("exit with %d code", ret);
+    return( result );
 }
 
-int done(int result)
-{
-	DBG("exit with %d code", result);
-	LOG_DONE;
-	exit(result);
-	return result;
-}

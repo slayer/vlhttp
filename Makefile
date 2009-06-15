@@ -1,7 +1,10 @@
 
+COPT=-DLIBLOG_ENABLED=1 -O -W -Wall -I liblog
+
 linux:
-	$(CC) -O -W -Wall -c -I liblog -o log.o liblog/log.c
-	$(CC) -O -W -Wall -o elhttp log.o elhttp.c
+	$(CC) $(COPT) -c -o log.o liblog/log.c
+	$(CC) $(COPT) -c -o elhttp.o elhttp.c
+	$(CC) $(COPT) -o elhttp log.o elhttp.o
 	strip elhttp
 
 sunos:
