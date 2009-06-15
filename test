@@ -11,3 +11,5 @@ curl -D - -vvv --proxy $PROXY_HOST:$PROXY_PORT  http://medportal.ru/mednovosti/ 
 echo -e "\n---------------------------------------------------------------------------------\n"
 curl -D - -vvv --proxy $PROXY_HOST:$PROXY_PORT  "http://medportal.ru/search/?mednovosti=on&Query=asdf" 2>&1
 echo -e "\n---------------------------------------------------------------------------------\n"
+curl -D - -v --proxy $PROXY_HOST:$PROXY_PORT  "http://forum.infocom.ua/styles/xabbblue/imageset/site_logo1.png" >/dev/null
+echo -e "\n---------------------------------------------------------------------------------\n"

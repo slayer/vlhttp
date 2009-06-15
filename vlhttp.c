@@ -428,7 +428,7 @@ int client_thread( struct thread_data *td )
 	int result = -1;
     uint32 client_ip;
 
-#define BUF_SIZE 1024
+#define BUF_SIZE 1500
 	char logbuf[BUF_SIZE];
     char *pstr, *white_space;
     char buffer[BUF_SIZE];
@@ -486,14 +486,16 @@ int client_thread( struct thread_data *td )
         goto exit;
     }
         
+	memset(buffer, 0, BUF_SIZE);
     if( ( n = recv( client_fd, buffer, sizeof(buffer)-1, 0 ) ) <= 0 ) {
 		WARN("recv() fail", 0);
         result = 12;
 		goto exit;
     }
 
-	snprintf(logbuf, n, "%s", buffer);
-	DBG("Received from Client: '\n%s' n=%d", logbuf, n);
+	//snprintf(logbuf, n, "%s", buffer);
+	//DBG("Received from Client: '\n%s' n=%d", logbuf, n);
+	LOG_HEXDUMP("Received from Client", buffer, n);
 
 
     memset( last_host, 0, sizeof( last_host ) );
@@ -501,6 +503,16 @@ int client_thread( struct thread_data *td )
 process_request:
 
     buffer[n] = '\0';
+
+	memset(url, 0, BUF_SIZE);
+	memset(request, 0, BUF_SIZE);
+	memset(url_host, 0, BUF_SIZE);
+	memset(url_req, 0, BUF_SIZE);
+	memset(headers, 0, BUF_SIZE);
+	memset(method, 0, sizeof(method));
+	memset(http_proto_ver, 0, sizeof(http_proto_ver));
+	memset(host, 0, sizeof(host));
+
 
 #if 0
     /* log the client request */
@@ -569,10 +581,12 @@ process_request:
 		goto exit;
 	}
 	DBG("-  http_proto_ver: '%s'", http_proto_ver);
+	LOG_HEXDUMP("http_proto_ver", http_proto_ver, sizeof(http_proto_ver));
 
 	/* Parse headers */
-	snprintf(headers, BUF_SIZE, "%s", white_space + 1);
+	snprintf(headers, BUF_SIZE, "%s", white_space);
 	DBG("-  headers: '%s'", headers);
+	LOG_HEXDUMP("headers", headers, BUF_SIZE);
 	http11_host = get_header("Host", headers);
 
 	/* Parse HTTP host and request*/
@@ -714,10 +728,8 @@ process_request:
     {
 
 		pstr = buffer;
-		pstr += snprintf(pstr, BUF_SIZE, "%s %s%s %s%s", method, scheme, url, http_proto_ver, headers); 
-		n = (pstr - buffer) + 1;
-		snprintf(logbuf, n, "%s", buffer);
-		DBG("-  buffer now: '\n%s', n=%d", buffer, n);
+		n = snprintf(pstr, BUF_SIZE, "%s %s%s%s %s%s", method, scheme, url_host, url_req, http_proto_ver, headers); 
+		LOG_HEXDUMP("SEND TO SERVER", buffer, n);
 #if 0
 		snprintf(logbuf, n, "BUFFER NOW: '%s', n=%d\n", buffer, n);
 		fprintf(td->logfile, "%s", logbuf);
@@ -757,11 +769,12 @@ process_request:
 
         if( FD_ISSET( remote_fd, &rfds ) )
         {
-            if( ( n = recv( remote_fd, buffer, 1023, 0 ) ) <= 0 ) {
+            if( ( n = recv( remote_fd, buffer, BUF_SIZE-1, 0 ) ) <= 0 ) {
                 result = 26;
 				goto exit;
             }
-#if 1
+			LOG_HEXDUMP("RECEIVE FROM SERVER", buffer, n);
+#if 0
 			snprintf(logbuf, n+1, "%s", buffer);
 			DBG("RECV: '%s', n=%d\n", logbuf, n);
 #endif
@@ -780,7 +793,7 @@ process_request:
 
         if( FD_ISSET( client_fd, &rfds ) )
         {
-            if( ( n = recv( client_fd, buffer, 1023, 0 ) ) <= 0 ) {
+            if( ( n = recv( client_fd, buffer, BUF_SIZE-1, 0 ) ) <= 0 ) {
                 result = 28;
 				goto exit;
             }
