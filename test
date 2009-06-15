@@ -1,0 +1,13 @@
+#!/bin/sh
+
+PROXY_HOST=195.20.28.211
+PROXY_PORT=8080
+
+curl -D - -vvv --proxy $PROXY_HOST:$PROXY_PORT  http://medportal.ru 2>&1
+echo -e "\n---------------------------------------------------------------------------------\n"
+curl -D - -vvv --proxy $PROXY_HOST:$PROXY_PORT  http://medportal.ru/ 2>&1
+echo -e "\n---------------------------------------------------------------------------------\n"
+curl -D - -vvv --proxy $PROXY_HOST:$PROXY_PORT  http://medportal.ru/mednovosti/ 2>&1
+echo -e "\n---------------------------------------------------------------------------------\n"
+curl -D - -vvv --proxy $PROXY_HOST:$PROXY_PORT  "http://medportal.ru/search/?mednovosti=on&Query=asdf" 2>&1
+echo -e "\n---------------------------------------------------------------------------------\n"
