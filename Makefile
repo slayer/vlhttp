@@ -1,5 +1,6 @@
 
-COPT=-DLIBLOG_ENABLED=1 -O -W -Wall -I liblog
+#COPT=-DLIBLOG_ENABLED=1 -O -W -Wall -I liblog
+COPT=-O -W -Wall -I liblog
 
 linux:
 	$(CC) $(COPT) -c -o log.o liblog/log.c
