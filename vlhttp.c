@@ -429,7 +429,6 @@ int client_thread( struct thread_data *td )
     uint32 client_ip;
 
 #define BUF_SIZE 1500
-	char logbuf[BUF_SIZE];
     char *pstr, *white_space;
     char buffer[BUF_SIZE];
     char *url_port=NULL;
@@ -493,9 +492,7 @@ int client_thread( struct thread_data *td )
 		goto exit;
     }
 
-	//snprintf(logbuf, n, "%s", buffer);
-	//DBG("Received from Client: '\n%s' n=%d", logbuf, n);
-	LOG_HEXDUMP("Received from Client", buffer, n);
+	LOG_HEXDUMP("Received from Client", (unsigned char*)buffer, n);
 
 
     memset( last_host, 0, sizeof( last_host ) );
@@ -581,12 +578,10 @@ process_request:
 		goto exit;
 	}
 	DBG("-  http_proto_ver: '%s'", http_proto_ver);
-	LOG_HEXDUMP("http_proto_ver", http_proto_ver, sizeof(http_proto_ver));
 
 	/* Parse headers */
 	snprintf(headers, BUF_SIZE, "%s", white_space);
 	DBG("-  headers: '%s'", headers);
-	LOG_HEXDUMP("headers", headers, BUF_SIZE);
 	http11_host = get_header("Host", headers);
 
 	/* Parse HTTP host and request*/
@@ -729,7 +724,7 @@ process_request:
 
 		pstr = buffer;
 		n = snprintf(pstr, BUF_SIZE, "%s %s%s%s %s%s", method, scheme, url_host, url_req, http_proto_ver, headers); 
-		LOG_HEXDUMP("SEND TO SERVER", buffer, n);
+		LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, n);
 #if 0
 		snprintf(logbuf, n, "BUFFER NOW: '%s', n=%d\n", buffer, n);
 		fprintf(td->logfile, "%s", logbuf);
@@ -773,10 +768,8 @@ process_request:
                 result = 26;
 				goto exit;
             }
-			LOG_HEXDUMP("RECEIVE FROM SERVER", buffer, n);
 #if 0
-			snprintf(logbuf, n+1, "%s", buffer);
-			DBG("RECV: '%s', n=%d\n", logbuf, n);
+			LOG_HEXDUMP("RECEIVE FROM SERVER", (unsigned char*)buffer, n);
 #endif
 
             state = 1; /* client finished sending data */
