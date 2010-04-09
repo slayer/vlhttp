@@ -19,7 +19,6 @@
  */
 
 #define _GNU_SOURCE
-#ifndef WIN32
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -28,24 +27,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <netdb.h>
-
-#define recv(a,b,c,d) read(a,b,c)
-#define send(a,b,c,d) write(a,b,c)
-
-#else
-
-#pragma comment( lib, "ws2_32.lib" )
-
-#include <winsock2.h>
-#include <windows.h>
-
-#endif
-
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include "liblog/log.h"
+#include "base64.h"
 
 #ifndef uint32
 #define uint32 unsigned long int
@@ -57,6 +44,7 @@
 #define CR '\r'
 #define LF '\n'
 #define CRLF "\r\n"
+#define VERSION "0.1"
 
 
 
@@ -69,39 +57,128 @@ struct thread_data
     uint32 client_ip;
     int connect;
 };
+struct sockaddr_in proxy_addr;
+struct sockaddr_in client_addr;
+struct thread_data td;
+int proxy_port, proxy_fd;
+char proxy_realm[64] = "vlhttp proxy";
+char *proxy_auth = NULL;
+int foreground_mode = 0;
 
 int client_thread( struct thread_data *td );
+char *request = NULL;
+struct req_t
+{
+    char method[32];
+    char http_ver[16];
+    char url[1024];
+    char headers[2048];
+    char hostname[1024];
+    int  port;
+    char scheme[16];
+    char url_host[256];
+    char url_path[1024];
+    char url_port[1024];
+};
+struct req_t req;
 
-#define done(result) \
-	DBG("exit with %d code", result); \
-	LOG_DONE; \
-	return result; \
+int init_proxy()
+{
+    /* create a new session */
+    int n;
 
+    if (!foreground_mode) {
+        if( setsid() < 0 ) {
+            ERR("setsid() fail", 0);
+            return 0;
+        }
 
-#ifndef WIN32
+        /* close all file descriptors */
 
+        for( n = 0; n < 1024; n++ ) {
+            close( n );
+        }
+    }
+
+    td.logfile = NULL;
+
+    /* create a socket */
+
+    proxy_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
+
+    if( proxy_fd < 0 ) {
+        ERR("socket fail()", 0);
+        return 0;
+    }
+
+    /* bind the proxy on the local port and listen */
+
+    n = 1;
+
+    if( setsockopt( proxy_fd, SOL_SOCKET, SO_REUSEADDR,
+                    (void *) &n, sizeof( n ) ) < 0 )
+    {
+        ERR("setsockopt() fail", 0);
+        return 0;
+    }
+
+    proxy_addr.sin_family      = AF_INET;
+    proxy_addr.sin_port        = htons( (unsigned short) proxy_port );
+    proxy_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if( bind( proxy_fd, (struct sockaddr *) &proxy_addr,
+              sizeof( proxy_addr ) ) < 0 )
+    {
+        ERR("bind() fail()", 0);
+        return 0;
+    }
+
+    if( listen( proxy_fd, 10 ) != 0 ) {
+        ERR("listen() fail", 0);
+        return 0;
+    }
+    return 1;
+}
 
 int main( int argc, char *argv[] )
 {
     int pid;
 
-    int n, proxy_port, proxy_fd;
-    struct sockaddr_in proxy_addr;
-    struct sockaddr_in client_addr;
-    struct thread_data td;
 
     /* read the arguments */
-
-    proxy_port = ( argc > 1 ) ?        atoi( argv[1] ) : 8208;
-    td.auth_ip = ( argc > 2 ) ?   inet_addr( argv[2] ) :    0;
-    td.netmask = ( argc > 3 ) ?   inet_addr( argv[3] ) :    0;
-    td.logfile = ( argc > 4 ) ? fopen( argv[4], "a+" ) : NULL;
-    td.connect = ( argc > 5 ) ?        atoi( argv[5] ) :    1;
+    td.connect = 1;
+    td.logfile = NULL;
+	LOG_INIT(NULL);//"/tmp/vlhttp-debug.log");
+    LOG_SET_LEVEL(LOG_LEVEL_DBG);
+    char opt;
+    while((opt = getopt(argc, argv, "p:i:m:r:A:f")) != -1) {
+        switch(opt) {
+            case 'A':
+                encode_base64(optarg, strlen(optarg), (unsigned char**)(&proxy_auth));
+                DBG("proxy_auth: %s", proxy_auth);
+                break;
+            case 'r':
+                strncpy(proxy_realm, optarg, sizeof(proxy_realm));
+                break;
+            case 'p':
+                proxy_port = atoi(optarg);
+                break;
+            case 'i':
+                td.auth_ip = inet_addr(optarg);
+                break;
+            case 'm':
+                td.netmask = inet_addr(optarg);
+                break;
+            case 'f':
+                DBG("turn off daemon", 0);
+                foreground_mode = 1;
+                break;
+        }
+    }
 
     td.auth_ip &= td.netmask;
     td.client_ip = 0;
 
-	LOG_INIT("/tmp/vlhttp-debug.log");
 	DBG("========================================================================================================", 0);
 
     /* is inetd mode enabled ? */
@@ -118,119 +195,31 @@ int main( int argc, char *argv[] )
         return( r );
     }
 
-#if 0
     /* fork into background */
-
-    if( ( pid = fork() ) < 0 )
-    {
-        done( 2 );
+    if (!foreground_mode) {
+        if ( (pid = fork() ) < 0 ) {
+            ERR("fork() fail", 0);
+            return -1;
+        }
+        if (pid) return ( 0 );
     }
 
-    if( pid ) return ( 0 );
 
-    /* create a new session */
-
-    if( setsid() < 0 )
-    {
-        done( 3 );
-    }
-
-    /* close all file descriptors */
-
-    for( n = 0; n < 1024; n++ )
-    {
-        close( n );
-    }
-
-    td.logfile = ( argc > 4 ) ? fopen( argv[4], "a+" ) : NULL;
-#endif
-#else
-
-HANDLE tdSem;
-
-#define close(fd) closesocket(fd)
-
-int main( int argc, char *argv[] )
-{
-    int tid;
-    WSADATA wsaData;
-
-    int n, proxy_port, proxy_fd;
-    struct sockaddr_in proxy_addr;
-    struct sockaddr_in client_addr;
-    struct thread_data td;
-
-    FreeConsole();
-
-    tdSem = CreateSemaphore( NULL, 0, 1, NULL );
-
-    if( WSAStartup( MAKEWORD(2,0), &wsaData ) == SOCKET_ERROR )
-    {
-        return( 3 );
-    }
-
-    /* read the arguments */
-
-    proxy_port = ( argc > 1 ) ?        atoi( argv[1] ) : 8208;
-    td.auth_ip = ( argc > 2 ) ?   inet_addr( argv[2] ) :    0;
-    td.netmask = ( argc > 3 ) ?   inet_addr( argv[3] ) :    0;
-    td.logfile = ( argc > 4 ) ? fopen( argv[4], "a+" ) : NULL;
-    td.connect = ( argc > 5 ) ?        atoi( argv[5] ) :    1;
-
-	LOG_INIT("vlhttp-debug.log");
-    td.auth_ip &= td.netmask;
-    td.client_ip = 0;
-
-#endif
-
-    /* create a socket */
-
-    proxy_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
-
-    if( proxy_fd < 0 )
-    {
-        done( 4 );
-    }
-
-    /* bind the proxy on the local port and listen */
-
-#ifndef WIN32
-
-    n = 1;
-
-    if( setsockopt( proxy_fd, SOL_SOCKET, SO_REUSEADDR,
-                    (void *) &n, sizeof( n ) ) < 0 )
-    {
-        done( 5 );
-    }
-
-#endif
-
-    proxy_addr.sin_family      = AF_INET;
-    proxy_addr.sin_port        = htons( (unsigned short) proxy_port );
-    proxy_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if( bind( proxy_fd, (struct sockaddr *) &proxy_addr,
-              sizeof( proxy_addr ) ) < 0 )
-    {
-        done( 6 );
-    }
-
-    if( listen( proxy_fd, 10 ) != 0 )
-    {
-        done( 7 );
+    if (!init_proxy()) {
+        return -1;
     }
 
     while( 1 )
     {
-        n = sizeof( client_addr );
+        int n = sizeof( client_addr );
 
         /* wait for inboud connections */
 
         if( ( td.client_fd = accept( proxy_fd,
                 (struct sockaddr *) &client_addr, (socklen_t*)&n ) ) < 0 )
         {
-            done( 8 );
+            ERR("accept() fail", 0);
+            return -1;
         }
 
         td.client_ip = client_addr.sin_addr.s_addr;
@@ -242,8 +231,6 @@ int main( int argc, char *argv[] )
             close( td.client_fd );
             continue;
         }
-
-#ifndef WIN32
 
         /* fork a child to handle the connection */
 
@@ -266,136 +253,45 @@ int main( int argc, char *argv[] )
 
         if( ( pid = fork() ) < 0 )
         {
-            done( 9 );
+            ERR("fork() fail", 0);
+            return -1;
         }
 
         if( pid ) return ( 0 );
 
         return( client_thread( &td ) );
 
-#else
-
-        /* spawn a thread to handle the connection */
-
-        CloseHandle( CreateThread( NULL, 0, (LPTHREAD_START_ROUTINE)
-                                   client_thread, &td, 0, &tid ) );
-
-        /* wait until the thread has read its data */
-
-        WaitForSingleObject( tdSem, INFINITE );
-
-#endif
-
     }
 
     /* not reached */
 
-    done( -1 );
-}
-
-void log_request( FILE *logfile, uint32 client_ip,
-                  char *headers, int headers_len )
-{
-    int i;
-    time_t t;
-    struct tm *lt;
-    char hyphen[2];
-    char buffer[1024];
-    char strbuf[32];
-    char *ref, *u_a;
-
-    memcpy( buffer, headers, headers_len + 1 );
-
-    /* search for the Referer: and User-Agent: */
-
-    hyphen[0] = '-';
-    hyphen[1] = '\0';
-
-    memset( strbuf, 0, sizeof( strbuf ) );
-
-    strbuf[0] = 'R'; strbuf[3] = 'e'; strbuf[6] = 'r';
-    strbuf[1] = 'e'; strbuf[4] = 'r'; strbuf[7] = ':';
-    strbuf[2] = 'f'; strbuf[5] = 'e'; strbuf[8] = ' ';
-
-    ref = strstr( buffer, strbuf );
-    ref = ( ( ref == NULL ) ? hyphen : ref +  9 );
-
-    strbuf[0] = 'U'; strbuf[4] = '-'; strbuf[ 8] = 'n';
-    strbuf[1] = 's'; strbuf[5] = 'A'; strbuf[ 9] = 't';
-    strbuf[2] = 'e'; strbuf[6] = 'g'; strbuf[10] = ':';
-    strbuf[3] = 'r'; strbuf[7] = 'e'; strbuf[11] = ' ';
-
-    u_a = strstr( buffer, strbuf );
-    u_a = ( ( u_a == NULL ) ? hyphen : u_a + 12 );
-
-    /* replace special characters with ' ' */
-
-    for( i = 0; i < headers_len; i++ )
-    {
-        if( buffer[i] < 32 )
-        {
-            if( buffer[i] == '\r' && buffer[i + 1] == '\n' )
-                buffer[i] = '\0';
-            else
-                buffer[i] = ' ';
-        }
-    }
-
-    /* finally print the stuff */
-
-    t = time( NULL );
-    lt = localtime( &t );
-
-    lt->tm_year += 1900;
-    lt->tm_mon++;
-
-    /* for some reason I dislike fixed strings in executables */
-
-    strbuf[ 0] = '['; strbuf[11] = '%'; strbuf[22] = '0';
-    strbuf[ 1] = '%'; strbuf[12] = '0'; strbuf[23] = '2';
-    strbuf[ 2] = '0'; strbuf[13] = '2'; strbuf[24] = 'd';
-    strbuf[ 3] = '4'; strbuf[14] = 'd'; strbuf[25] = ':';
-    strbuf[ 4] = 'd'; strbuf[15] = ' '; strbuf[26] = '%';
-    strbuf[ 5] = '-'; strbuf[16] = '%'; strbuf[27] = '0';
-    strbuf[ 6] = '%'; strbuf[17] = '0'; strbuf[28] = '2';
-    strbuf[ 7] = '0'; strbuf[18] = '2'; strbuf[29] = 'd';
-    strbuf[ 8] = '2'; strbuf[19] = 'd'; strbuf[30] = ']';
-    strbuf[ 9] = 'd'; strbuf[20] = ':'; strbuf[31] = '\0';
-    strbuf[10] = '-'; strbuf[21] = '%';
-
-    fprintf( logfile, strbuf,
-             lt->tm_year, lt->tm_mon, lt->tm_mday,
-             lt->tm_hour, lt->tm_min, lt->tm_sec );
-
-    strbuf[ 0] = ' '; strbuf[10] = '%'; strbuf[20] = 's';
-    strbuf[ 1] = '%'; strbuf[11] = 'd'; strbuf[21] = '"';
-    strbuf[ 2] = 'd'; strbuf[12] = ' '; strbuf[22] = ' ';
-    strbuf[ 3] = '.'; strbuf[13] = '"'; strbuf[23] = '"';
-    strbuf[ 4] = '%'; strbuf[14] = '%'; strbuf[24] = '%';
-    strbuf[ 5] = 'd'; strbuf[15] = 's'; strbuf[25] = 's';
-    strbuf[ 6] = '.'; strbuf[16] = '"'; strbuf[26] = '"';
-    strbuf[ 7] = '%'; strbuf[17] = ' '; strbuf[27] = '\r';
-    strbuf[ 8] = 'd'; strbuf[18] = '"'; strbuf[28] = '\n';
-    strbuf[ 9] = '.'; strbuf[19] = '%'; strbuf[29] = '\0';
-
-    fprintf( logfile, strbuf,
-             (int) ( client_ip       ) & 0xFF,
-             (int) ( client_ip >>  8 ) & 0xFF,
-             (int) ( client_ip >> 16 ) & 0xFF,
-             (int) ( client_ip >> 24 ) & 0xFF,
-             buffer, ref, u_a );
-
-    fflush( logfile );
+    return -1;
 }
 
 void bad_request(struct thread_data *td )
 {
 	char message[]="<html><body><h1>Bad request</h1></body><html>";
-	DBG("send: '%s'", message);
-	send( td->client_fd, message, sizeof(message), 0 );
-}
+    ssize_t writed;
 
-char* get_header(const char* header, const char* headers)
+	DBG("write: '%s'", message);
+	writed = write( td->client_fd, message, sizeof(message));
+}
+void unauthorized(struct thread_data *td )
+{
+	char buf[1024], *pstr = buf;
+    ssize_t writed;
+    INFO("Unauthorized", 0);
+
+    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 407 Proxy Authentication Required\r\nServer: vlhttp"VERSION"\r\n");
+    if (proxy_auth) {
+        pstr += snprintf(pstr, sizeof(buf), "Proxy-Authenticate: Basic realm=\"%s\"\r\n", proxy_realm);
+    }
+    pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: vlhttp "VERSION"</body></html>\r\n");
+
+	DBG("SEND TO CLIENT: '%s'", buf);
+	writed = write( td->client_fd, buf, strlen(buf));
+}
+char *get_header(const char *header)
 {
 	char *s;
 	char headname[256];
@@ -403,7 +299,7 @@ char* get_header(const char* header, const char* headers)
 	char *start = NULL, *end = NULL;
 
 	snprintf(headname, sizeof(headname), "\n%s: ", header);
-	s = strstr(headers, headname);
+	s = strstr(req.headers, headname);
 	if (s) {
 		start = s + strlen(headname); 
 		if ( (end = strchr(start, '\r')) || (end = strchr(start, '\n'))) 
@@ -419,33 +315,158 @@ char* get_header(const char* header, const char* headers)
 	return result;
 }
 
+int remove_header(const char *header)
+{
+	char *s;
+	char headname[256];
+	int result = 0;
+	char *next_header = NULL, *end = NULL;
+    char *end_of_headers = strstr(req.headers, "\r\n\r\n");
+
+    if (!end_of_headers)
+        goto end;
+
+	snprintf(headname, sizeof(headname)-1, "\n%s: ", header);
+	s = strstr(req.headers, headname);
+	if (s) {
+        s++;                                        // cut first \n
+        if (!(end = strstr(s, "\r\n")))     // get next header
+            goto end;                               // bad header!
+        next_header = end + 2;
+        memmove(s, next_header, strlen(next_header)+1);
+
+        // cleanup tail
+        //memset(&req.headers[strlen(req.headers)+1], 0, sizeof(req.headers) - strlen(req.headers)); 
+
+        result = 1;
+	}
+
+	if ( result ) {
+		//DBG("- HEADER removed '%s'", req.headers);
+	} else {
+		//DBG("- HEADER '%s' not found", req.headers);
+	}
+
+end:
+	return result;
+}
+
+int is_authorized()
+{
+    char *req_auth = NULL;
+    char req_scheme[32];
+    char req_encoded[32];
+    int result = 0;
+
+    if (!proxy_auth) {
+        result = 1;
+        goto exit;
+    }
+
+    req_auth = get_header("Proxy-Authorization");
+    
+    if (!req_auth)
+        goto exit;
+
+    if (sscanf(req_auth, "%31s %31s", req_scheme, req_encoded) < 2) {
+        WARN("bad auth: %s", req_auth);
+        goto exit;
+    }
+
+    if (strcmp(req_scheme, "Basic")) {
+        WARN("bad auth scheme: %s", req_scheme);
+        goto exit;
+    }
+
+    if (strcmp(req_encoded, proxy_auth) == 0) {
+        result = 1;
+    }
+
+exit:
+    if (req_auth)
+        free(req_auth);
+    if (!result)
+        WARN("UNAUTHORIZED", 0);
+    return result;
+
+}
+
+int parse_hostname()
+{
+    char *host = get_header("Host");
+    char *colon;
+    
+    if (!host) {
+        host = strdup(req.url_host);
+    }
+    if (!host)
+        return 0;
+
+    if ( (colon = strchr(host, ':'))) {
+        colon[0] = '\0';
+    }
+    strncpy(req.hostname, host, sizeof(req.hostname)-1);
+    free(host);
+
+    return 1;
+}
+int parse_request()
+{
+    if ( sscanf(request, "%31s %1023s %15s", req.method, req.url, req.http_ver) != 3) {
+        return 0;
+    };
+	DBG("-  method: '%s'", req.method);
+	DBG("-  url: '%s'", req.url);
+	DBG("-  http_ver: '%s'", req.http_ver);
+    
+    char *headers = strstr(request, "\r\n");
+    if (headers) {
+        strncpy(req.headers, headers, sizeof(req.headers)-1);
+        DBG("-  headers: '%s'", req.headers);
+    }
+
+    req.port = 80;
+
+    if (sscanf(req.url, "%[^:]://%[^/]%[^\r\n]", req.scheme, req.url_host, req.url_path) < 2)
+        return 0;
+
+    char *colon;
+    if ((colon = strchr(req.url_host, ':'))) {
+        colon++;
+        req.port = atoi(colon);
+        if ( req.port <= 0 ) {
+            WARN("bad port %d", req.port);
+            return 0;
+        }
+    }
+
+    if (!parse_hostname())
+        return 0;
+	DBG("-  req.scheme: '%s'", req.scheme);
+	DBG("-  req.url_host: '%s'", req.url_host);
+	DBG("-  req.url_path: '%s'", req.url_path);
+	DBG("-  req.port: '%d'", req.port);
+	DBG("-  req.hostname: '%s'", req.hostname);
+    return 1;
+}
+
+
 int client_thread( struct thread_data *td )
 {
     int remote_fd = -1;
-    int remote_port;
-    int state, c_flag=0;
+    int state, method_connect=0;
     int n, client_fd;
 	int result = -1;
     uint32 client_ip;
+    ssize_t writed;
 
 #define BUF_SIZE 1500
-    char *pstr, *white_space;
+#define REQ_SIZE 10000
     char buffer[BUF_SIZE];
-    char *url_port=NULL;
-	char last_host[256];
-
-	char method[16];
-	char scheme[16] = "http://";
-	char http_proto_ver[16];
-	char host[256];
-
-	char *url = malloc(BUF_SIZE);
-	char *request = malloc(BUF_SIZE);
-	char *url_host = malloc(BUF_SIZE);
-	char *url_req = malloc(BUF_SIZE);
-	char *headers = malloc(BUF_SIZE);
-
-	char *http11_host = NULL;
+    char last_host[BUF_SIZE];
+    request = malloc(REQ_SIZE);
+    char *preq = request;
+    memset(&req, 0, sizeof(req));
 
 
     struct sockaddr_in remote_addr;
@@ -455,28 +476,16 @@ int client_thread( struct thread_data *td )
     fd_set rfds;
 
 	FENTER;
-	ASSERT(url);
 	ASSERT(request);
-	ASSERT(url_host);
-	ASSERT(url_req);
 
     client_fd = td->client_fd;
     client_ip = td->client_ip;
 
-#ifdef WIN32
-
-    /* let the master thread continue */
-
-    ReleaseSemaphore( tdSem, 1, NULL );
-
-#endif
-
     /* fetch the http request headers */
-
     FD_ZERO( &rfds );
     FD_SET( (unsigned int) client_fd, &rfds );
 
-    timeout.tv_sec  = 10;
+    timeout.tv_sec  = 15;
     timeout.tv_usec =  0;
 
     if( select( client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0 ) {
@@ -486,45 +495,213 @@ int client_thread( struct thread_data *td )
     }
         
 	memset(buffer, 0, BUF_SIZE);
-    if( ( n = recv( client_fd, buffer, sizeof(buffer)-1, 0 ) ) <= 0 ) {
-		WARN("recv() fail", 0);
-        result = 12;
-		goto exit;
+    while(1) {
+        if( ( n = read( client_fd, buffer, sizeof(buffer)-1 ) ) <= 0 ) {
+            WARN("read() fail", 0);
+            result = 12;
+            goto exit;
+        }
+        preq += snprintf(preq, REQ_SIZE-(preq-request-1), "%s", buffer);
+        if (strstr(buffer, "\r\n\r\n")) {
+            //DBG("got CRLFCRLF", 0);
+            break;
+        }
     }
 
-	LOG_HEXDUMP("Received from Client", (unsigned char*)buffer, n);
+//#define DUMP
+#ifdef DUMP
+		LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, strlen(request)+1);
+#endif
+    if (!parse_request()) {
+        WARN("bad request:", request);
+        return -1;
+    };
 
-
-    memset( last_host, 0, sizeof( last_host ) );
 
 process_request:
 
-    buffer[n] = '\0';
-
-	memset(url, 0, BUF_SIZE);
-	memset(request, 0, BUF_SIZE);
-	memset(url_host, 0, BUF_SIZE);
-	memset(url_req, 0, BUF_SIZE);
-	memset(headers, 0, BUF_SIZE);
-	memset(method, 0, sizeof(method));
-	memset(http_proto_ver, 0, sizeof(http_proto_ver));
-	memset(host, 0, sizeof(host));
-
-
-#if 0
-    /* log the client request */
-
-    if( td->logfile != NULL )
-    {
-        log_request( td->logfile, client_ip, buffer, n );
+    if (!is_authorized()) {
+        unauthorized(td);
+        goto exit;
     }
 
-    /* obfuscated CONNECT method search */
-#endif
+    //LOG_HEXDUMP("BEFORE", (unsigned char*)req.headers, BUF_SIZE);
+    remove_header("Proxy-Authorization");
+    remove_header("Proxy-Connection");
+    //LOG_HEXDUMP("AFTER", (unsigned char*)req.headers, BUF_SIZE);
+
+    /* resolve the http server hostname */
+    if( !(req.hostname) || !( remote_host = gethostbyname( req.hostname ) ) ) {
+		WARN("-  fail to resolve '%s'", req.hostname);
+        result = 19;
+		goto exit;
+    }
 
 #if 0
-    c_flag = 0;
+    if( method_connect )
+    {
+        if( td->connect == 1 && req.port != 443 )
+        {
+            result = 20;
+			goto exit;
+        }
+    }
+#endif
 
+    /* connect to the remote server, if not already connected */
+
+    if ( strcmp(req.hostname, last_host) ) {
+        shutdown( remote_fd, 2 );
+        close( remote_fd );
+
+        remote_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
+
+        if (remote_fd < 0) {
+			WARN("-  socket() fail", 0);
+            result = 21;
+			goto exit;
+        }
+
+        remote_addr.sin_family = AF_INET;
+        remote_addr.sin_port = htons( (unsigned short) req.port );
+
+        memcpy( (void *) &remote_addr.sin_addr,
+                (void *) remote_host->h_addr,
+                remote_host->h_length );
+
+        if ( connect( remote_fd, (struct sockaddr *) &remote_addr, sizeof( remote_addr ) ) < 0 ) {
+			WARN("-  connect() to '%s:%d' fail", req.hostname, req.port);
+            result = 22;
+            goto exit;
+        }
+        DBG("-  connected to %s", req.url_host);
+
+        memset( last_host, 0, sizeof( last_host ) );
+        strncpy( last_host, req.hostname, sizeof( last_host ) - 1 );
+    }
+
+#if 0
+    if( method_connect )
+    {
+        /* send HTTP/1.0 200 OK */
+
+        buffer[0] = 'H'; buffer[ 7] = '0'; buffer[14] = 'K';
+        buffer[1] = 'T'; buffer[ 8] = ' '; buffer[15] = '\r';
+        buffer[2] = 'T'; buffer[ 9] = '2'; buffer[16] = '\n';
+        buffer[3] = 'P'; buffer[10] = '0'; buffer[17] = '\r';
+        buffer[4] = '/'; buffer[11] = '0'; buffer[18] = '\n';
+        buffer[5] = '1'; buffer[12] = ' ';
+        buffer[6] = '.'; buffer[13] = 'O';
+
+        if( write( client_fd, buffer, 19, 0 ) != 19 )
+        {
+            result = 23;
+			goto exit;
+        }
+    }
+    else
+#endif
+    {
+
+		n = snprintf(buffer, BUF_SIZE, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers); 
+        if( (writed = write(remote_fd, buffer, n)) != n ) {
+            WARN("write() fail: %d", writed);
+            result = 24;
+			goto exit;
+        }
+#ifdef DUMP
+		LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, BUF_SIZE);
+        DBG("-  size %d+%d+%d+%d=%d", strlen(req.method), strlen(req.url), strlen(req.http_ver), strlen(req.headers), strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) );
+        DBG("-  sended to server %d(0x%x) of %d(0x%x) bytes", writed, writed, n, n);
+#endif
+    }
+
+    /* tunnel the data between the client and the server */
+
+    state = 0;
+
+    while( 1 )
+    {
+        FD_ZERO( &rfds );
+        FD_SET( (unsigned int) client_fd, &rfds );
+        FD_SET( (unsigned int) remote_fd, &rfds );
+    
+        n = ( client_fd > remote_fd ) ? client_fd : remote_fd;
+
+        if( select( n + 1, &rfds, NULL, NULL, NULL ) < 0 )
+        {
+            result = 25;
+			goto exit;
+        }
+
+        if( FD_ISSET( remote_fd, &rfds ) )
+        {
+            if( ( n = read( remote_fd, buffer, BUF_SIZE-1) ) <= 0 ) {
+                WARN("read() fail: %d", n);
+                result = 26;
+				goto exit;
+            }
+#ifdef DUMP
+			LOG_HEXDUMP("RECEIVE FROM SERVER", (unsigned char*)buffer, n);
+#endif
+
+            state = 1; /* client finished sending data */
+
+            if( (writed = write( client_fd, buffer, n )) != n ) {
+                WARN("write() fail: %d", writed);
+                result = 27;
+				goto exit;
+            }
+#ifdef DUMP
+			LOG_HEXDUMP("SEND TO CLIENT", (unsigned char*)buffer, n);
+#endif
+        }
+
+        if ( FD_ISSET( client_fd, &rfds ) )
+        {
+            if ( (n = read( client_fd, buffer, BUF_SIZE-1)) <= 0 ) {
+                WARN("read() fail: %d", n);
+                result = 28;
+				goto exit;
+            }
+#ifdef DUMP
+			LOG_HEXDUMP("RECEIVE FROM CLIENT", (unsigned char*)buffer, n);
+#endif
+
+            if( state && ! method_connect )
+            {
+                /* new http request */
+
+                goto process_request;
+            }
+
+            if ((writed = write( remote_fd, buffer, n)) != n ) {
+                WARN("write() fail: %d", writed);
+                result = 29;
+				goto exit;
+            }
+#ifdef DUMP
+			LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, n);
+#endif
+        }
+    }
+
+
+    /* not reached */
+exit:
+
+    shutdown( client_fd, 2 );
+    shutdown( remote_fd, 2 );
+    close( client_fd );
+    close( remote_fd );
+	if (request) free(request);
+	FLEAVEA("exit with %d code", result);
+    return( result );
+}
+
+
+#if 0
+    method_connect = 0;
     if( buffer[0] == 'C' && buffer[4] == 'E' &&
         buffer[1] == 'O' && buffer[5] == 'C' &&
         buffer[2] == 'N' && buffer[6] == 'T' &&
@@ -532,53 +709,14 @@ process_request:
     {
         if( ! td->connect )
         {
-            result = 13 );
+            result = 13;
         }
 
-        c_flag = 1;
+        method_connect = 1;
     }
 #endif
 
-	/* Parse method (GET, POST, PUT, etc.) */
-	white_space = strchr(buffer, ' ');
-	if ( white_space ) {
-		snprintf(method, MIN(sizeof(method)-1, (unsigned int) (white_space-buffer)+1), buffer);
-		white_space[0] = '\0';
-	} else {
-		bad_request(td);
-		ASSERT(white_space);
-		result = 14;
-		goto exit;
-	}
-	DBG("-  method: '%s'", method);
-
-	/* Parse URL */
-	pstr = white_space + 1;
-	white_space = strchr(pstr, ' ');
-	if ( white_space ) {
-		white_space[0] = '\0';
-		snprintf(url, BUF_SIZE, "%s", pstr);
-	} else {
-		bad_request(td);
-		ASSERT(white_space);
-		result = 15;
-		goto exit;
-	}
-	DBG("-  url: '%s'", url);
-
-	/* Parse HTTP ver */
-	pstr = white_space + 1;
-	white_space = strchr(pstr, CR);
-	if ( *pstr && white_space ) {
-		snprintf(http_proto_ver, MIN(sizeof(http_proto_ver)-1, (unsigned int) (white_space-pstr)+1), "%s", pstr);
-	} else {
-		WARN("bad request: '%s'", pstr);
-		bad_request(td);
-		result = 16;
-		goto exit;
-	}
-	DBG("-  http_proto_ver: '%s'", http_proto_ver);
-
+#if 0
 	/* Parse headers */
 	snprintf(headers, BUF_SIZE, "%s", white_space);
 	DBG("-  headers: '%s'", headers);
@@ -635,189 +773,13 @@ process_request:
 		}
 	} else { 
 		url_port = "80";
-		snprintf(host, BUF_SIZE, url_host);
+		snprintf(host, sizeof(host), "%s", url_host);
 	}
 
 	DBG("-  host: '%s'", host);
 	DBG("-  url_port: '%s'", url_port);
 
 
-    /* resolve the http server hostname */
-    if( ! ( remote_host = gethostbyname( host ) ) ) {
-		DBG("-  fail to resolve '%s'", host);
-        result = 19;
-		goto exit;
-    }
 
-	remote_port = atoi( url_port );
-	if ( !remote_port ) {
-		WARN("   fail to resolve port '%s'", url_port);
-		result = 20;
-		goto exit;
-	}
 
-#if 0
-    if( c_flag )
-    {
-        if( td->connect == 1 && remote_port != 443 )
-        {
-            result = 20;
-			goto exit;
-        }
-    }
 #endif
-
-    /* connect to the remote server, if not already connected */
-
-    if( strcmp( host, last_host ) )
-    {
-        shutdown( remote_fd, 2 );
-        close( remote_fd );
-
-        remote_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
-
-        if( remote_fd < 0 ) {
-            result = 21;
-			goto exit;
-        }
-
-        remote_addr.sin_family = AF_INET;
-        remote_addr.sin_port = htons( (unsigned short) remote_port );
-
-        memcpy( (void *) &remote_addr.sin_addr,
-                (void *) remote_host->h_addr,
-                remote_host->h_length );
-
-        if( connect( remote_fd, (struct sockaddr *) &remote_addr, sizeof( remote_addr ) ) < 0 ) {
-			DBG("-  connect() fail", 0);
-            result = 22;
-			goto exit;
-        }
-
-        memset( last_host, 0, sizeof( last_host ) );
-
-        strncpy( last_host, host, sizeof( last_host ) - 1 );
-    }
-
-#if 0
-    if( c_flag )
-    {
-        /* send HTTP/1.0 200 OK */
-
-        buffer[0] = 'H'; buffer[ 7] = '0'; buffer[14] = 'K';
-        buffer[1] = 'T'; buffer[ 8] = ' '; buffer[15] = '\r';
-        buffer[2] = 'T'; buffer[ 9] = '2'; buffer[16] = '\n';
-        buffer[3] = 'P'; buffer[10] = '0'; buffer[17] = '\r';
-        buffer[4] = '/'; buffer[11] = '0'; buffer[18] = '\n';
-        buffer[5] = '1'; buffer[12] = ' ';
-        buffer[6] = '.'; buffer[13] = 'O';
-
-        if( send( client_fd, buffer, 19, 0 ) != 19 )
-        {
-            result = 23;
-			goto exit;
-        }
-    }
-    else
-#endif
-    {
-
-		pstr = buffer;
-		n = snprintf(pstr, BUF_SIZE, "%s %s%s%s %s%s", method, scheme, url_host, url_req, http_proto_ver, headers); 
-		LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, n);
-#if 0
-		snprintf(logbuf, n, "BUFFER NOW: '%s', n=%d\n", buffer, n);
-		fprintf(td->logfile, "%s", logbuf);
-
-        /* remove "http://hostname[:port]" & send headers */
-
-        m_len = url_host - 7 - buffer;
-
-        n -= 7 + ( str_end - url_host );
-
-        memcpy( str_end -= m_len, buffer, m_len );
-#endif
-
-        if( send( remote_fd, buffer, n, 0 ) != n ) {
-            result = 24;
-			goto exit;
-        }
-    }
-
-    /* tunnel the data between the client and the server */
-
-    state = 0;
-
-    while( 1 )
-    {
-        FD_ZERO( &rfds );
-        FD_SET( (unsigned int) client_fd, &rfds );
-        FD_SET( (unsigned int) remote_fd, &rfds );
-    
-        n = ( client_fd > remote_fd ) ? client_fd : remote_fd;
-
-        if( select( n + 1, &rfds, NULL, NULL, NULL ) < 0 )
-        {
-            result = 25;
-			goto exit;
-        }
-
-        if( FD_ISSET( remote_fd, &rfds ) )
-        {
-            if( ( n = recv( remote_fd, buffer, BUF_SIZE-1, 0 ) ) <= 0 ) {
-                result = 26;
-				goto exit;
-            }
-#if 0
-			LOG_HEXDUMP("RECEIVE FROM SERVER", (unsigned char*)buffer, n);
-#endif
-
-            state = 1; /* client finished sending data */
-
-            if( send( client_fd, buffer, n, 0 ) != n ) {
-                result = 27;
-				goto exit;
-            }
-#if 0
-			snprintf(logbuf, n, "%s", buffer);
-			fprintf(td->logfile, "SEND: '%s', n=%d\n", logbuf, n);
-#endif
-        }
-
-        if( FD_ISSET( client_fd, &rfds ) )
-        {
-            if( ( n = recv( client_fd, buffer, BUF_SIZE-1, 0 ) ) <= 0 ) {
-                result = 28;
-				goto exit;
-            }
-
-            if( state && ! c_flag )
-            {
-                /* new http request */
-
-                goto process_request;
-            }
-
-            if( send( remote_fd, buffer, n, 0 ) != n ) {
-                result = 29;
-				goto exit;
-            }
-        }
-    }
-
-    /* not reached */
-exit:
-
-    shutdown( client_fd, 2 );
-    shutdown( remote_fd, 2 );
-    close( client_fd );
-    close( remote_fd );
-	if (url) free(url);
-	if (request) free(request);
-	if (url_host) free(url_host);
-	if (url_req) free(url_req);	
-	if (http11_host) free(http11_host);	
-	FLEAVEA("exit with %d code", result);
-    return( result );
-}
-
