@@ -233,7 +233,6 @@ int main( int argc, char *argv[] )
         }
 
         /* fork a child to handle the connection */
-
         if( ( pid = fork() ) < 0 )
         {
             close( td.client_fd );
@@ -280,7 +279,6 @@ void unauthorized(struct thread_data *td )
 {
 	char buf[1024], *pstr = buf;
     ssize_t writed;
-    INFO("Unauthorized", 0);
 
     pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 407 Proxy Authentication Required\r\nServer: vlhttp"VERSION"\r\n");
     if (proxy_auth) {
@@ -351,12 +349,32 @@ end:
 	return result;
 }
 
+int add_header(const char* name, const char* value)
+{
+	char *s;
+	int result = 0;
+    char *end_of_headers = strstr(req.headers, "\r\n\r\n");
+    if (!end_of_headers)
+        goto end;
+
+    // check room
+    if ( (sizeof(req.headers) - strlen(req.headers) - strlen(name) - strlen(value) - 10) <= 0)
+        goto end;
+
+    s = end_of_headers + 2;                 // to end of last header
+    sprintf(s, "%s: %s\r\n\r\n", name, value);
+    result = 1;
+end:
+    return result;
+}
+
 int is_authorized()
 {
     char *req_auth = NULL;
     char req_scheme[32];
     char req_encoded[32];
     int result = 0;
+    char *reason = "unknown";
 
     if (!proxy_auth) {
         result = 1;
@@ -365,28 +383,37 @@ int is_authorized()
 
     req_auth = get_header("Proxy-Authorization");
     
-    if (!req_auth)
+    if (!req_auth) {
+        reason = "header does not exists";
         goto exit;
+    }
 
     if (sscanf(req_auth, "%31s %31s", req_scheme, req_encoded) < 2) {
+        reason = "scanf fail";
         WARN("bad auth: %s", req_auth);
         goto exit;
     }
 
     if (strcmp(req_scheme, "Basic")) {
         WARN("bad auth scheme: %s", req_scheme);
+        reason = "auth scheme does not supported";
         goto exit;
     }
 
     if (strcmp(req_encoded, proxy_auth) == 0) {
         result = 1;
+    } else {
+        reason = "user/pass invalid";
     }
 
 exit:
     if (req_auth)
         free(req_auth);
-    if (!result)
-        WARN("UNAUTHORIZED", 0);
+    if (!result) {
+        WARN("UNAUTHORIZED: %s", reason);
+    } else {
+        INFO("AUTHORIZED", 0);
+    }
     return result;
 
 }
@@ -412,14 +439,24 @@ int parse_hostname()
 }
 int parse_request()
 {
+    int result = 0;
     if ( sscanf(request, "%31s %1023s %15s", req.method, req.url, req.http_ver) != 3) {
-        return 0;
+        ERR("sscanf() fail", 0);
+        goto end;
     };
 	DBG("-  method: '%s'", req.method);
 	DBG("-  url: '%s'", req.url);
 	DBG("-  http_ver: '%s'", req.http_ver);
     
     char *headers = strstr(request, "\r\n");
+    char *end_of_req = strstr(headers, "\r\n\r\n");
+
+    if (!end_of_req) {
+        ERR("CRLFCRLF does not found", 0);
+        goto end;
+    }
+    end_of_req[4] = '\0'; // terminate request by 0 char
+
     if (headers) {
         strncpy(req.headers, headers, sizeof(req.headers)-1);
         DBG("-  headers: '%s'", req.headers);
@@ -427,26 +464,47 @@ int parse_request()
 
     req.port = 80;
 
-    if (sscanf(req.url, "%[^:]://%[^/]%[^\r\n]", req.scheme, req.url_host, req.url_path) < 2)
-        return 0;
+    if (sscanf(req.url, "%[^:]://%[^/]%[^\r\n]", req.scheme, req.url_host, req.url_path) < 2) {
+        ERR("sscanf() fail", 0);
+        goto end;
+    }
 
     char *colon;
     if ((colon = strchr(req.url_host, ':'))) {
         colon++;
         req.port = atoi(colon);
         if ( req.port <= 0 ) {
-            WARN("bad port %d", req.port);
-            return 0;
+            ERR("bad port %d", req.port);
+            goto end;
         }
     }
 
-    if (!parse_hostname())
-        return 0;
+    if (!parse_hostname()) {
+        ERR("parse_hostname() fail", 0);
+        goto end;
+    }
+    result = 1;
 	DBG("-  req.scheme: '%s'", req.scheme);
 	DBG("-  req.url_host: '%s'", req.url_host);
 	DBG("-  req.url_path: '%s'", req.url_path);
 	DBG("-  req.port: '%d'", req.port);
 	DBG("-  req.hostname: '%s'", req.hostname);
+end:
+    return result;
+}
+
+int is_syscmd()
+{
+    return 0;
+}
+
+int is_sys_authorized()
+{
+    return 0;
+}
+
+int process_sys_cmd()
+{
     return 1;
 }
 
@@ -459,6 +517,7 @@ int client_thread( struct thread_data *td )
 	int result = -1;
     uint32 client_ip;
     ssize_t writed;
+    int already_authorized = 0;
 
 #define BUF_SIZE 1500
 #define REQ_SIZE 10000
@@ -488,42 +547,53 @@ int client_thread( struct thread_data *td )
     timeout.tv_sec  = 15;
     timeout.tv_usec =  0;
 
-    if( select( client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0 ) {
-		WARN("select() timeout", 0);
+    if ( select(client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0) {
+		ERR("select() timeout", 0);
 		result = 11;
         goto exit;
     }
         
 	memset(buffer, 0, BUF_SIZE);
-    while(1) {
-        if( ( n = read( client_fd, buffer, sizeof(buffer)-1 ) ) <= 0 ) {
-            WARN("read() fail", 0);
+    while (1) {
+        char *end_of_req = NULL;
+        if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
+            ERR("read() fail", 0);
             result = 12;
             goto exit;
         }
-        preq += snprintf(preq, REQ_SIZE-(preq-request-1), "%s", buffer);
-        if (strstr(buffer, "\r\n\r\n")) {
+        // append
+        preq += snprintf(preq, REQ_SIZE-(preq-request-2), "%s", buffer);
+
+        if ((end_of_req = strstr(buffer, "\r\n\r\n"))) {
             //DBG("got CRLFCRLF", 0);
+            end_of_req[4] = '\0';
             break;
         }
     }
+process_request:
 
 //#define DUMP
 #ifdef DUMP
-		LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, strlen(request)+1);
+    LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, strlen(request)+1);
 #endif
     if (!parse_request()) {
         WARN("bad request:", request);
         return -1;
     };
 
-
-process_request:
-
-    if (!is_authorized()) {
-        unauthorized(td);
-        goto exit;
+    if (!already_authorized) { 
+        if (is_authorized()) {
+            already_authorized = 1;
+        } else {
+            unauthorized(td);
+            goto exit;
+        }
     }
+
+    if ( is_syscmd() && is_sys_authorized() ) {
+        process_sys_cmd();
+    }
+
 
     //LOG_HEXDUMP("BEFORE", (unsigned char*)req.headers, BUF_SIZE);
     remove_header("Proxy-Authorization");
@@ -549,7 +619,6 @@ process_request:
 #endif
 
     /* connect to the remote server, if not already connected */
-
     if ( strcmp(req.hostname, last_host) ) {
         shutdown( remote_fd, 2 );
         close( remote_fd );
@@ -574,10 +643,12 @@ process_request:
             result = 22;
             goto exit;
         }
-        DBG("-  connected to %s", req.url_host);
+        DBG("-  connected to %s:%d", req.url_host, req.port);
 
         memset( last_host, 0, sizeof( last_host ) );
         strncpy( last_host, req.hostname, sizeof( last_host ) - 1 );
+    } else {
+        INFO("reuse current connection", 0);
     }
 
 #if 0
@@ -611,7 +682,7 @@ process_request:
         }
 #ifdef DUMP
 		LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, BUF_SIZE);
-        DBG("-  size %d+%d+%d+%d=%d", strlen(req.method), strlen(req.url), strlen(req.http_ver), strlen(req.headers), strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) );
+        DBG("-  size %d+%d+%d+%d+2=%d", strlen(req.method), strlen(req.url), strlen(req.http_ver), strlen(req.headers), strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) + 2 );
         DBG("-  sended to server %d(0x%x) of %d(0x%x) bytes", writed, writed, n, n);
 #endif
     }
@@ -642,7 +713,7 @@ process_request:
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("RECEIVE FROM SERVER", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("RECEIVE FROM SERVER (tunneled)", (unsigned char*)buffer, n);
 #endif
 
             state = 1; /* client finished sending data */
@@ -653,7 +724,7 @@ process_request:
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("SEND TO CLIENT", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("SEND TO CLIENT (tunneled)", (unsigned char*)buffer, n);
 #endif
         }
 
@@ -665,13 +736,13 @@ process_request:
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("RECEIVE FROM CLIENT", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("RECEIVE FROM CLIENT (tunneled)", (unsigned char*)buffer, n);
 #endif
 
-            if( state && ! method_connect )
-            {
+            if ( state && !method_connect ) {
                 /* new http request */
-
+                WARN("NEW HTTP REQ", 0);
+                strncpy(request, buffer, MIN((size_t)n, REQ_SIZE-1));
                 goto process_request;
             }
 
@@ -681,7 +752,7 @@ process_request:
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("SEND TO SERVER (tunneled)", (unsigned char*)buffer, n);
 #endif
         }
     }
