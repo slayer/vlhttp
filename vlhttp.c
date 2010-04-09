@@ -63,6 +63,7 @@ struct thread_data td;
 int proxy_port, proxy_fd;
 char proxy_realm[64] = "vlhttp proxy";
 char *proxy_auth = NULL;
+char *sys_auth = NULL;
 int foreground_mode = 0;
 
 int client_thread( struct thread_data *td );
@@ -151,11 +152,15 @@ int main( int argc, char *argv[] )
 	LOG_INIT(NULL);//"/tmp/vlhttp-debug.log");
     LOG_SET_LEVEL(LOG_LEVEL_DBG);
     char opt;
-    while((opt = getopt(argc, argv, "p:i:m:r:A:f")) != -1) {
+    while((opt = getopt(argc, argv, "p:i:m:r:A:S:f")) != -1) {
         switch(opt) {
             case 'A':
                 encode_base64(optarg, strlen(optarg), (unsigned char**)(&proxy_auth));
                 DBG("proxy_auth: %s", proxy_auth);
+                break;
+            case 'S':
+                encode_base64(optarg, strlen(optarg), (unsigned char**)(&sys_auth));
+                DBG("sys_auth: %s", sys_auth);
                 break;
             case 'r':
                 strncpy(proxy_realm, optarg, sizeof(proxy_realm));
@@ -275,20 +280,28 @@ void bad_request(struct thread_data *td )
 	DBG("write: '%s'", message);
 	writed = write( td->client_fd, message, sizeof(message));
 }
-void unauthorized(struct thread_data *td )
+
+void common_unauthorized(struct thread_data *td, int code, const char* status_str)
 {
 	char buf[1024], *pstr = buf;
     ssize_t writed;
 
-    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 407 Proxy Authentication Required\r\nServer: vlhttp"VERSION"\r\n");
-    if (proxy_auth) {
-        pstr += snprintf(pstr, sizeof(buf), "Proxy-Authenticate: Basic realm=\"%s\"\r\n", proxy_realm);
-    }
+    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: vlhttp"VERSION"\r\n", code, status_str);
+    pstr += snprintf(pstr, sizeof(buf), "Authenticate: Basic realm=\"%s\"\r\n", proxy_realm);
     pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: vlhttp "VERSION"</body></html>\r\n");
 
 	DBG("SEND TO CLIENT: '%s'", buf);
 	writed = write( td->client_fd, buf, strlen(buf));
 }
+void proxy_unauthorized(struct thread_data *td )
+{
+    common_unauthorized(td, 407, "Proxy ");
+}
+void sys_unauthorized(struct thread_data *td )
+{
+    common_unauthorized(td, 401, "");
+}
+
 char *get_header(const char *header)
 {
 	char *s;
@@ -368,56 +381,6 @@ end:
     return result;
 }
 
-int is_authorized()
-{
-    char *req_auth = NULL;
-    char req_scheme[32];
-    char req_encoded[32];
-    int result = 0;
-    char *reason = "unknown";
-
-    if (!proxy_auth) {
-        result = 1;
-        goto exit;
-    }
-
-    req_auth = get_header("Proxy-Authorization");
-    
-    if (!req_auth) {
-        reason = "header does not exists";
-        goto exit;
-    }
-
-    if (sscanf(req_auth, "%31s %31s", req_scheme, req_encoded) < 2) {
-        reason = "scanf fail";
-        WARN("bad auth: %s", req_auth);
-        goto exit;
-    }
-
-    if (strcmp(req_scheme, "Basic")) {
-        WARN("bad auth scheme: %s", req_scheme);
-        reason = "auth scheme does not supported";
-        goto exit;
-    }
-
-    if (strcmp(req_encoded, proxy_auth) == 0) {
-        result = 1;
-    } else {
-        reason = "user/pass invalid";
-    }
-
-exit:
-    if (req_auth)
-        free(req_auth);
-    if (!result) {
-        WARN("UNAUTHORIZED: %s", reason);
-    } else {
-        INFO("AUTHORIZED", 0);
-    }
-    return result;
-
-}
-
 int parse_hostname()
 {
     char *host = get_header("Host");
@@ -495,16 +458,81 @@ end:
 
 int is_syscmd()
 {
-    return 0;
+    if ( strcmp(req.hostname, "syscmd") == 0 ) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
+int is_common_authorized(const char* header, const char* userpass64)
+{
+    char *req_auth = NULL;
+    char req_scheme[32];
+    char req_encoded[32];
+    int result = 0;
+    char *reason = "unknown";
+
+    if (!userpass64) {
+        result = 1;
+        goto exit;
+    }
+
+    req_auth = get_header(header);
+    
+    if (!req_auth) {
+        reason = "header does not exists";
+        goto exit;
+    }
+
+    if (sscanf(req_auth, "%31s %31s", req_scheme, req_encoded) < 2) {
+        reason = "scanf fail";
+        WARN("bad auth: %s", req_auth);
+        goto exit;
+    }
+
+    if (strcmp(req_scheme, "Basic")) {
+        WARN("bad auth scheme: %s", req_scheme);
+        reason = "auth scheme does not supported";
+        goto exit;
+    }
+
+    if (strcmp(req_encoded, userpass64) == 0) {
+        result = 1;
+    } else {
+        reason = "user/pass invalid";
+    }
+
+exit:
+    if (req_auth)
+        free(req_auth);
+    if (!result) {
+        WARN("UNAUTHORIZED: %s", reason);
+    } else {
+        INFO("AUTHORIZED", 0);
+    }
+    return result;
+}
+int is_proxy_authorized()
+{
+    return is_common_authorized("Proxy-Authorization", proxy_auth);
+}
 int is_sys_authorized()
 {
-    return 0;
+    // reject if sys auth is not set
+    if (!sys_auth)
+        return 0;
+    return is_common_authorized("Authorization", sys_auth);
 }
+
+
 
 int process_sys_cmd()
 {
+    // here reject too
+    if (!sys_auth)
+        return 0;
+    //system(req.url);
     return 1;
 }
 
@@ -582,16 +610,22 @@ process_request:
     };
 
     if (!already_authorized) { 
-        if (is_authorized()) {
+        if (is_proxy_authorized()) {
             already_authorized = 1;
         } else {
-            unauthorized(td);
+            proxy_unauthorized(td);
             goto exit;
         }
     }
 
-    if ( is_syscmd() && is_sys_authorized() ) {
-        process_sys_cmd();
+    if ( is_syscmd() ) {
+        if ( is_sys_authorized() ) {
+            process_sys_cmd();
+            goto exit;
+        } else {
+            sys_unauthorized(td);
+            goto exit;
+        }
     }
 
 
