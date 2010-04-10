@@ -71,6 +71,7 @@ char *request = NULL;
 struct req_t
 {
     char method[32];
+    char connect;
     char http_ver[16];
     char url[1024];
     char headers[2048];
@@ -425,11 +426,18 @@ int parse_request()
         DBG("-  headers: '%s'", req.headers);
     }
 
-    req.port = 80;
-
-    if (sscanf(req.url, "%[^:]://%[^/]%[^\r\n]", req.scheme, req.url_host, req.url_path) < 2) {
-        ERR("sscanf() fail", 0);
-        goto end;
+    if ( strcmp("CONNECT", req.method) == 0 ) {
+        if (sscanf(req.url, "%s", req.url_host) < 1) {
+            ERR("sscanf() fail", 0);
+            goto end;
+        }
+        req.connect = 1;
+    } else {
+        req.port = 80;
+        if (sscanf(req.url, "%[^:]://%[^/]%[^\r\n]", req.scheme, req.url_host, req.url_path) < 2) {
+            ERR("sscanf() fail", 0);
+            goto end;
+        }
     }
 
     char *colon;
@@ -543,7 +551,7 @@ int process_sys_cmd()
 int client_thread( struct thread_data *td )
 {
     int remote_fd = -1;
-    int state, method_connect=0;
+    int state;
     int n, client_fd;
 	int result = -1;
     uint32 client_ip;
@@ -646,22 +654,18 @@ process_request:
     //LOG_HEXDUMP("AFTER", (unsigned char*)req.headers, BUF_SIZE);
 
     /* resolve the http server hostname */
-    if( !(req.hostname) || !( remote_host = gethostbyname( req.hostname ) ) ) {
+    if ( !(req.hostname) || !( remote_host = gethostbyname( req.hostname ) ) ) {
 		WARN("-  fail to resolve '%s'", req.hostname);
         result = 19;
 		goto exit;
     }
 
-#if 0
-    if( method_connect )
-    {
-        if( td->connect == 1 && req.port != 443 )
-        {
+    if ( req.connect ) {
+        if( td->connect == 1 && req.port != 443 ) {
             result = 20;
 			goto exit;
         }
     }
-#endif
 
     /* connect to the remote server, if not already connected */
     if ( strcmp(req.hostname, last_host) ) {
@@ -696,27 +700,17 @@ process_request:
         INFO("reuse current connection", 0);
     }
 
-#if 0
-    if( method_connect )
-    {
+    if ( req.connect ) {
         /* send HTTP/1.0 200 OK */
+        snprintf(buffer, sizeof(buffer), "HTTP/1.0 200 OK\r\n\r\n");
 
-        buffer[0] = 'H'; buffer[ 7] = '0'; buffer[14] = 'K';
-        buffer[1] = 'T'; buffer[ 8] = ' '; buffer[15] = '\r';
-        buffer[2] = 'T'; buffer[ 9] = '2'; buffer[16] = '\n';
-        buffer[3] = 'P'; buffer[10] = '0'; buffer[17] = '\r';
-        buffer[4] = '/'; buffer[11] = '0'; buffer[18] = '\n';
-        buffer[5] = '1'; buffer[12] = ' ';
-        buffer[6] = '.'; buffer[13] = 'O';
-
-        if( write( client_fd, buffer, 19, 0 ) != 19 )
-        {
+        if ( write(client_fd, buffer, 19) != 19 ) {
+            WARN("write() fail", 0);
             result = 23;
 			goto exit;
         }
     }
     else
-#endif
     {
 		n = snprintf(buffer, BUF_SIZE, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers); 
         if ((writed = write(remote_fd, buffer, n)) != n ) {
@@ -789,9 +783,9 @@ process_request:
             DBG("RECEIVED FROM CLIENT (tunneled) %d bytes", n);
 #endif
 
-            if ( state && !method_connect ) {
+            if ( state && !req.connect ) {
                 /* new http request */
-                WARN("NEW HTTP REQ", 0);
+                INFO("-  process new http request", 0);
                 int req_len = MIN((size_t)n, REQ_SIZE-1);
                 strncpy(request, buffer, req_len);
                 preq = request + req_len;
