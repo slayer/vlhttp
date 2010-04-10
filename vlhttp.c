@@ -281,13 +281,13 @@ void bad_request(struct thread_data *td )
 	writed = write( td->client_fd, message, sizeof(message));
 }
 
-void common_unauthorized(struct thread_data *td, int code, const char* status_str)
+void common_unauthorized(struct thread_data *td, int code)
 {
 	char buf[1024], *pstr = buf;
     ssize_t writed;
 
-    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: vlhttp"VERSION"\r\n", code, status_str);
-    pstr += snprintf(pstr, sizeof(buf), "Authenticate: Basic realm=\"%s\"\r\n", proxy_realm);
+    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: vlhttp"VERSION"\r\n", code, code == 407 ? "Proxy " : "" );
+    pstr += snprintf(pstr, sizeof(buf), "%sAuthenticate: Basic realm=\"%s\"\r\n", code == 407 ? "Proxy-" : "", proxy_realm);
     pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: vlhttp "VERSION"</body></html>\r\n");
 
 	DBG("SEND TO CLIENT: '%s'", buf);
@@ -295,11 +295,11 @@ void common_unauthorized(struct thread_data *td, int code, const char* status_st
 }
 void proxy_unauthorized(struct thread_data *td )
 {
-    common_unauthorized(td, 407, "Proxy ");
+    common_unauthorized(td, 407);
 }
 void sys_unauthorized(struct thread_data *td )
 {
-    common_unauthorized(td, 401, "");
+    common_unauthorized(td, 401);
 }
 
 char *get_header(const char *header)
@@ -453,6 +453,9 @@ int parse_request()
 	DBG("-  req.port: '%d'", req.port);
 	DBG("-  req.hostname: '%s'", req.hostname);
 end:
+    if (!result) {
+        LOG_HEXDUMP("BAD REQUEST", (unsigned char*)request, strlen(request)+1);
+    }
     return result;
 }
 
@@ -548,11 +551,10 @@ int client_thread( struct thread_data *td )
     int already_authorized = 0;
 
 #define BUF_SIZE 1500
-#define REQ_SIZE 10000
+#define REQ_SIZE 15000
     char buffer[BUF_SIZE];
     char last_host[BUF_SIZE];
     request = malloc(REQ_SIZE);
-    char *preq = request;
     memset(&req, 0, sizeof(req));
 
 
@@ -581,28 +583,37 @@ int client_thread( struct thread_data *td )
         goto exit;
     }
         
+    char *end_of_req = NULL;
+    char *preq = request;
 	memset(buffer, 0, BUF_SIZE);
-    while (1) {
-        char *end_of_req = NULL;
+    if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
+        ERR("read() fail", 0);
+        result = 12;
+        goto exit;
+    }
+    DBG("-  recv %d bytes", n);
+    // append
+    preq += snprintf(preq, REQ_SIZE-(preq-request-2), "%s", buffer);
+
+process_request:
+    while ( !(end_of_req = strstr(request, "\r\n\r\n")) ) {
+        DBG("-  request without %s", ANSI_WHITE"CRLFCRLF"ANSI_RESET);
         if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
             ERR("read() fail", 0);
             result = 12;
             goto exit;
         }
+        DBG("-  recv %d bytes", n);
         // append
         preq += snprintf(preq, REQ_SIZE-(preq-request-2), "%s", buffer);
-
-        if ((end_of_req = strstr(buffer, "\r\n\r\n"))) {
-            //DBG("got CRLFCRLF", 0);
-            end_of_req[4] = '\0';
-            break;
-        }
     }
-process_request:
+    end_of_req[4] = '\0';
 
 //#define DUMP
 #ifdef DUMP
-    LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, strlen(request)+1);
+    LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, preq-request);
+#else
+    DBG("RECEIVED FROM CLIENT %d bytes", preq-request);
 #endif
     if (!parse_request()) {
         WARN("bad request:", request);
@@ -707,17 +718,18 @@ process_request:
     else
 #endif
     {
-
 		n = snprintf(buffer, BUF_SIZE, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers); 
-        if( (writed = write(remote_fd, buffer, n)) != n ) {
+        if ((writed = write(remote_fd, buffer, n)) != n ) {
             WARN("write() fail: %d", writed);
             result = 24;
 			goto exit;
         }
 #ifdef DUMP
-		LOG_HEXDUMP("SEND TO SERVER", (unsigned char*)buffer, BUF_SIZE);
+		LOG_HEXDUMP("SENDED TO SERVER", (unsigned char*)buffer, BUF_SIZE);
         DBG("-  size %d+%d+%d+%d+2=%d", strlen(req.method), strlen(req.url), strlen(req.http_ver), strlen(req.headers), strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) + 2 );
         DBG("-  sended to server %d(0x%x) of %d(0x%x) bytes", writed, writed, n, n);
+#else
+        DBG("SENDED TO SERVER %d bytes", n);
 #endif
     }
 
@@ -733,50 +745,56 @@ process_request:
     
         n = ( client_fd > remote_fd ) ? client_fd : remote_fd;
 
-        if( select( n + 1, &rfds, NULL, NULL, NULL ) < 0 )
-        {
+        if ( select( n + 1, &rfds, NULL, NULL, NULL ) < 0 ) {
+            ERR("select() fail", 0);
             result = 25;
 			goto exit;
         }
 
-        if( FD_ISSET( remote_fd, &rfds ) )
-        {
-            if( ( n = read( remote_fd, buffer, BUF_SIZE-1) ) <= 0 ) {
+        if ( FD_ISSET( remote_fd, &rfds ) ) {
+            if ( ( n = read( remote_fd, buffer, BUF_SIZE-1) ) <= 0 ) {
                 WARN("read() fail: %d", n);
                 result = 26;
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("RECEIVE FROM SERVER (tunneled)", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("RECEIVED FROM SERVER (tunneled)", (unsigned char*)buffer, n);
+#else
+            DBG("RECEIVED FROM SERVER (tunneled) %d bytes", n);
 #endif
 
             state = 1; /* client finished sending data */
 
-            if( (writed = write( client_fd, buffer, n )) != n ) {
+            if ( (writed = write( client_fd, buffer, n )) != n ) {
                 WARN("write() fail: %d", writed);
                 result = 27;
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("SEND TO CLIENT (tunneled)", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("SENDED TO CLIENT (tunneled)", (unsigned char*)buffer, n);
+#else
+            DBG("SENDED TO CLIENT (tunneled) %d bytes", n);
 #endif
         }
 
-        if ( FD_ISSET( client_fd, &rfds ) )
-        {
+        if ( FD_ISSET( client_fd, &rfds ) ) {
             if ( (n = read( client_fd, buffer, BUF_SIZE-1)) <= 0 ) {
                 WARN("read() fail: %d", n);
                 result = 28;
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("RECEIVE FROM CLIENT (tunneled)", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("RECEIVED FROM CLIENT (tunneled)", (unsigned char*)buffer, n);
+#else
+            DBG("RECEIVED FROM CLIENT (tunneled) %d bytes", n);
 #endif
 
             if ( state && !method_connect ) {
                 /* new http request */
                 WARN("NEW HTTP REQ", 0);
-                strncpy(request, buffer, MIN((size_t)n, REQ_SIZE-1));
+                int req_len = MIN((size_t)n, REQ_SIZE-1);
+                strncpy(request, buffer, req_len);
+                preq = request + req_len;
                 goto process_request;
             }
 
@@ -786,7 +804,9 @@ process_request:
 				goto exit;
             }
 #ifdef DUMP
-			LOG_HEXDUMP("SEND TO SERVER (tunneled)", (unsigned char*)buffer, n);
+			LOG_HEXDUMP("SENDED TO SERVER (tunneled)", (unsigned char*)buffer, n);
+#else
+            DBG("SENDED TO SERVER (tunneled) %d bytes", n);
 #endif
         }
     }
