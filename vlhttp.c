@@ -74,8 +74,8 @@ struct req_t
     char method[32];
     char connect;
     char http_ver[16];
-    char url[1024];
-    char headers[2048];
+    char url[2 * 1024];
+    char headers[10 * 1024];
     char hostname[1024];
     int  port;
     char scheme[16];
@@ -547,7 +547,6 @@ int process_sys_cmd()
     return 1;
 }
 
-
 int proxy_thread( struct thread_data *td )
 {
     int remote_fd = -1;
@@ -557,13 +556,19 @@ int proxy_thread( struct thread_data *td )
     uint32 client_ip;
     ssize_t writed;
     int already_authorized = 0;
+    // if some http data coming together with request
+    char *data = NULL;
+    int data_len = 0;
 
-#define BUF_SIZE 1500
-#define REQ_SIZE 15000
+#define BUF_SIZE 1504
+#define REQ_SIZE 15004
+#define clear_buffer() memset(buffer, 0, BUF_SIZE)
+#define clear_request() memset(request, 0, REQ_SIZE);
+#define clear_req() memset(&req, 0, sizeof(req));
+        
     char buffer[BUF_SIZE];
     char last_host[BUF_SIZE];
     request = malloc(REQ_SIZE);
-    memset(&req, 0, sizeof(req));
 
 
     struct sockaddr_in remote_addr;
@@ -590,10 +595,12 @@ int proxy_thread( struct thread_data *td )
 		result = 11;
         goto exit;
     }
-        
+
     char *end_of_req = NULL;
     char *preq = request;
-	memset(buffer, 0, BUF_SIZE);
+    clear_req();
+    clear_request();
+    clear_buffer();
     if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
         ERR("read() fail", 0);
         result = 12;
@@ -601,11 +608,13 @@ int proxy_thread( struct thread_data *td )
     }
     DBG("-  recv %d bytes", n);
     // append
-    preq += snprintf(preq, REQ_SIZE-(preq-request-2), "%s", buffer);
+    memcpy(preq, buffer, n);
+    preq += n;
 
 process_request:
     while ( !(end_of_req = strstr(request, "\r\n\r\n")) ) {
         DBG("-  request without %s", ANSI_WHITE"CRLFCRLF"ANSI_RESET);
+        clear_buffer();
         if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
             ERR("read() fail", 0);
             result = 12;
@@ -613,9 +622,23 @@ process_request:
         }
         DBG("-  recv %d bytes", n);
         // append
-        preq += snprintf(preq, REQ_SIZE-(preq-request-2), "%s", buffer);
+        memcpy(preq, buffer, n);
+        preq += n;
     }
-    end_of_req[4] = '\0';
+    end_of_req += 4; // first byte after CRLFCRLF
+
+    if ( (unsigned int)(end_of_req - request) == strlen(request) ) {
+        DBG("no data found in this request", 0);
+    } else {
+        data_len = preq - end_of_req;
+        DBG("%d data bytes found in this request", data_len);
+        data = malloc(data_len);
+        if (!data) {
+            ERR("malloc() %d", data_len);
+            goto exit;
+        }
+        memcpy(data, end_of_req, data_len);
+    }
 
 //#define DUMP
 #ifdef DUMP
@@ -668,7 +691,7 @@ process_request:
     }
 
     /* connect to the remote server, if not already connected */
-    if ( strcmp(req.hostname, last_host) ) {
+    if ( 1 || strcmp(req.hostname, last_host) ) {
         shutdown( remote_fd, 2 );
         close( remote_fd );
 
@@ -704,29 +727,56 @@ process_request:
         /* send HTTP/1.0 200 OK */
         snprintf(buffer, sizeof(buffer), "HTTP/1.0 200 OK\r\n\r\n");
 
-        if ( (n = write(client_fd, buffer, 19)) != 19 ) {
-            WARN("write() fail", 0);
+        if ( (writed = write(client_fd, buffer, 19)) != 19 ) {
+            WARN("write() fail: %d", writed);
             result = 23;
 			goto exit;
         }
-        req.sent_to_client += n;
+        req.sent_to_client += writed;
     }
     else
     {
-		n = snprintf(buffer, BUF_SIZE, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers); 
-        if ((writed = write(remote_fd, buffer, n)) != n) {
+        /* Construct and send modified request */
+        size_t server_req_size = strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) + 16;
+        char *server_req = malloc(server_req_size);
+        if (!server_req) {
+            ERR("malloc() fail: %d", server_req_size); 
+            result = 235;
+            goto exit;
+        }
+        memset(server_req, 0, server_req_size);
+		n = snprintf(server_req, server_req_size - 4, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers);
+        if ((writed = write(remote_fd, server_req, n)) != n) {
             WARN("write() fail: %d", writed);
             result = 24;
 			goto exit;
         }
-        req.sent_to_server += n;
+        req.sent_to_server += writed;
 #ifdef DUMP
-		LOG_HEXDUMP("SENDED TO SERVER", (unsigned char*)buffer, BUF_SIZE);
-        DBG("-  size %d+%d+%d+%d+2=%d", strlen(req.method), strlen(req.url), strlen(req.http_ver), strlen(req.headers), strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) + 2 );
-        DBG("-  sended to server %d(0x%x) of %d(0x%x) bytes", writed, writed, n, n);
+		LOG_HEXDUMP("SENDED TO SERVER", (unsigned char*)server_req, n);
 #else
         DBG("SENDED TO SERVER %d bytes", n);
 #endif
+        free(server_req);
+
+        if ( data ) {
+            // Some additional data was found in initial request
+            if ((writed = write(remote_fd, data, data_len)) != data_len) {
+                WARN("write() fail: %d", writed);
+                result = 35;
+                goto exit;
+            }
+            req.sent_to_server += writed;
+#ifdef DUMP
+            LOG_HEXDUMP("SENDED TO SERVER (data)", (unsigned char*)data, data_len);
+#else
+            DBG("SENDED TO SERVER %d bytes (data)", n);
+#endif
+            // clear data
+            free(data);
+            data = NULL;
+            data_len = 0;
+        }
     }
 
     /* tunnel the data between the client and the server */
@@ -748,6 +798,7 @@ process_request:
         }
 
         if ( FD_ISSET( remote_fd, &rfds ) ) {
+            clear_buffer();
             if ( ( n = read( remote_fd, buffer, BUF_SIZE-1) ) <= 0 ) {
                 WARN("read() fail: %d", n);
                 result = 26;
@@ -775,6 +826,7 @@ process_request:
         }
 
         if ( FD_ISSET( client_fd, &rfds ) ) {
+            clear_buffer();
             if ( (n = read( client_fd, buffer, BUF_SIZE-1)) <= 0 ) {
                 WARN("read() fail: %d", n);
                 result = 28;
@@ -790,6 +842,7 @@ process_request:
                 /* new http request */
                 INFO("-  process new http request", 0);
                 syslog_request();
+                memset(&req, 0, sizeof(req));
                 int req_len = MIN((size_t)n, REQ_SIZE-1);
                 strncpy(request, buffer, req_len);
                 preq = request + req_len;
