@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <syslog.h>
 #include "liblog/log.h"
 #include "base64.h"
 
@@ -66,7 +67,7 @@ char *proxy_auth = NULL;
 char *sys_auth = NULL;
 int foreground_mode = 0;
 
-int client_thread( struct thread_data *td );
+int proxy_thread( struct thread_data *td );
 char *request = NULL;
 struct req_t
 {
@@ -81,6 +82,8 @@ struct req_t
     char url_host[256];
     char url_path[1024];
     char url_port[1024];
+    int  sent_to_client;
+    int  sent_to_server;
 };
 struct req_t req;
 
@@ -103,6 +106,8 @@ int init_proxy()
     }
 
     td.logfile = NULL;
+
+    openlog("vlhttp", LOG_PID, LOG_DAEMON);
 
     /* create a socket */
 
@@ -195,7 +200,7 @@ int main( int argc, char *argv[] )
         td.client_fd = 0; /* stdin */
 
 		DBG("start",0);
-		r = client_thread( &td );
+		r = proxy_thread( &td );
 		DBG("exit with %d code", r);
 
         return( r );
@@ -231,22 +236,18 @@ int main( int argc, char *argv[] )
         td.client_ip = client_addr.sin_addr.s_addr;
 
         /* verify that the client is authorized */
-
-        if( ( td.client_ip & td.netmask ) != td.auth_ip )
-        {
+        if ( (td.client_ip & td.netmask) != td.auth_ip ) {
             close( td.client_fd );
             continue;
         }
 
         /* fork a child to handle the connection */
-        if( ( pid = fork() ) < 0 )
-        {
+        if ( (pid = fork()) < 0 ) {
             close( td.client_fd );
             continue;
         }
 
-        if( pid )
-        {
+        if (pid) {
             /* in father; wait for the child to terminate */
 
             close( td.client_fd );
@@ -255,44 +256,43 @@ int main( int argc, char *argv[] )
         }
 
         /* in child; fork & exit so that father becomes init */
-
-        if( ( pid = fork() ) < 0 )
-        {
+        if ((pid = fork()) < 0 ) {
             ERR("fork() fail", 0);
             return -1;
         }
 
-        if( pid ) return ( 0 );
+        if (pid)
+            return 0;
 
-        return( client_thread( &td ) );
+        return( proxy_thread( &td ) );
 
     }
 
     /* not reached */
-
     return -1;
+}
+
+void syslog_request(){
+    syslog(0, "%s %s%s%s%s %d/%d", req.method, req.scheme, strlen(req.scheme) ? "://" : "", req.url_host, req.url_path, req.sent_to_server, req.sent_to_client);
 }
 
 void bad_request(struct thread_data *td )
 {
 	char message[]="<html><body><h1>Bad request</h1></body><html>";
-    ssize_t writed;
-
 	DBG("write: '%s'", message);
-	writed = write( td->client_fd, message, sizeof(message));
+	req.sent_to_client += write( td->client_fd, message, sizeof(message));
 }
 
 void common_unauthorized(struct thread_data *td, int code)
 {
 	char buf[1024], *pstr = buf;
-    ssize_t writed;
 
     pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: vlhttp"VERSION"\r\n", code, code == 407 ? "Proxy " : "" );
-    pstr += snprintf(pstr, sizeof(buf), "%sAuthenticate: Basic realm=\"%s\"\r\n", code == 407 ? "Proxy-" : "", proxy_realm);
+    pstr += snprintf(pstr, sizeof(buf), "%sAuthenticate: Basic realm=\"%s\"\r\n", code == 407 ? "Proxy-" : "WWW-", proxy_realm);
     pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: vlhttp "VERSION"</body></html>\r\n");
 
 	DBG("SEND TO CLIENT: '%s'", buf);
-	writed = write( td->client_fd, buf, strlen(buf));
+	req.sent_to_client += write( td->client_fd, buf, strlen(buf));
 }
 void proxy_unauthorized(struct thread_data *td )
 {
@@ -543,12 +543,12 @@ int process_sys_cmd()
     // here reject too
     if (!sys_auth)
         return 0;
-    //system(req.url);
+    DBG("cmd: '%s'", req.url_path);
     return 1;
 }
 
 
-int client_thread( struct thread_data *td )
+int proxy_thread( struct thread_data *td )
 {
     int remote_fd = -1;
     int state;
@@ -704,20 +704,22 @@ process_request:
         /* send HTTP/1.0 200 OK */
         snprintf(buffer, sizeof(buffer), "HTTP/1.0 200 OK\r\n\r\n");
 
-        if ( write(client_fd, buffer, 19) != 19 ) {
+        if ( (n = write(client_fd, buffer, 19)) != 19 ) {
             WARN("write() fail", 0);
             result = 23;
 			goto exit;
         }
+        req.sent_to_client += n;
     }
     else
     {
 		n = snprintf(buffer, BUF_SIZE, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers); 
-        if ((writed = write(remote_fd, buffer, n)) != n ) {
+        if ((writed = write(remote_fd, buffer, n)) != n) {
             WARN("write() fail: %d", writed);
             result = 24;
 			goto exit;
         }
+        req.sent_to_server += n;
 #ifdef DUMP
 		LOG_HEXDUMP("SENDED TO SERVER", (unsigned char*)buffer, BUF_SIZE);
         DBG("-  size %d+%d+%d+%d+2=%d", strlen(req.method), strlen(req.url), strlen(req.http_ver), strlen(req.headers), strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) + 2 );
@@ -764,6 +766,7 @@ process_request:
                 result = 27;
 				goto exit;
             }
+            req.sent_to_client += n;
 #ifdef DUMP
 			LOG_HEXDUMP("SENDED TO CLIENT (tunneled)", (unsigned char*)buffer, n);
 #else
@@ -786,6 +789,7 @@ process_request:
             if ( state && !req.connect ) {
                 /* new http request */
                 INFO("-  process new http request", 0);
+                syslog_request();
                 int req_len = MIN((size_t)n, REQ_SIZE-1);
                 strncpy(request, buffer, req_len);
                 preq = request + req_len;
@@ -797,6 +801,7 @@ process_request:
                 result = 29;
 				goto exit;
             }
+            req.sent_to_server += n;
 #ifdef DUMP
 			LOG_HEXDUMP("SENDED TO SERVER (tunneled)", (unsigned char*)buffer, n);
 #else
@@ -813,8 +818,10 @@ exit:
     shutdown( remote_fd, 2 );
     close( client_fd );
     close( remote_fd );
+    syslog_request();
+    closelog();
 	if (request) free(request);
-	FLEAVEA("exit with %d code", result);
+	FLEAVEA("exit with %d code sent to client: %d, to server: %d", result, req.sent_to_client, req.sent_to_server);
     return( result );
 }
 
