@@ -84,6 +84,8 @@ struct req_t
     char url_port[1024];
     int  sent_to_client;
     int  sent_to_server;
+    char *data;
+    int  data_len;
 };
 struct req_t req;
 
@@ -345,7 +347,9 @@ int remove_header(const char *header)
         if (!(end = strstr(s, "\r\n")))     // get next header
             goto end;                               // bad header!
         next_header = end + 2;
-        memmove(s, next_header, strlen(next_header)+1);
+        int tail_len = strlen(next_header);
+        memmove(s, next_header, tail_len);
+        s[tail_len] = '\0';                 // terminate string
 
         // cleanup tail
         //memset(&req.headers[strlen(req.headers)+1], 0, sizeof(req.headers) - strlen(req.headers)); 
@@ -404,6 +408,9 @@ int parse_hostname()
 int parse_request()
 {
     int result = 0;
+
+    // cleanup req struct
+    memset(&req, 0, sizeof(req));
     if ( sscanf(request, "%31s %1023s %15s", req.method, req.url, req.http_ver) != 3) {
         ERR("sscanf() fail", 0);
         goto end;
@@ -557,14 +564,11 @@ int proxy_thread( struct thread_data *td )
     ssize_t writed;
     int already_authorized = 0;
     // if some http data coming together with request
-    char *data = NULL;
-    int data_len = 0;
 
 #define BUF_SIZE 1504
 #define REQ_SIZE 15004
 #define clear_buffer() memset(buffer, 0, BUF_SIZE)
 #define clear_request() memset(request, 0, REQ_SIZE);
-#define clear_req() memset(&req, 0, sizeof(req));
         
     char buffer[BUF_SIZE];
     char last_host[BUF_SIZE];
@@ -598,7 +602,6 @@ int proxy_thread( struct thread_data *td )
 
     char *end_of_req = NULL;
     char *preq = request;
-    clear_req();
     clear_request();
     clear_buffer();
     if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
@@ -630,14 +633,14 @@ process_request:
     if ( (unsigned int)(end_of_req - request) == strlen(request) ) {
         DBG("no data found in this request", 0);
     } else {
-        data_len = preq - end_of_req;
-        DBG("%d data bytes found in this request", data_len);
-        data = malloc(data_len);
-        if (!data) {
-            ERR("malloc() %d", data_len);
+        req.data_len = preq - end_of_req;
+        DBG("%d data bytes found in this request", req.data_len);
+        req.data = malloc(req.data_len);
+        if (!req.data) {
+            ERR("malloc() %d", req.data_len);
             goto exit;
         }
-        memcpy(data, end_of_req, data_len);
+        memcpy(req.data, end_of_req, req.data_len);
     }
 
 //#define DUMP
@@ -651,7 +654,7 @@ process_request:
         return -1;
     };
 
-    if (!already_authorized) { 
+    if (!already_authorized) {
         if (is_proxy_authorized()) {
             already_authorized = 1;
         } else {
@@ -759,23 +762,23 @@ process_request:
 #endif
         free(server_req);
 
-        if ( data ) {
+        if ( req.data ) {
             // Some additional data was found in initial request
-            if ((writed = write(remote_fd, data, data_len)) != data_len) {
+            if ((writed = write(remote_fd, req.data, req.data_len)) != req.data_len) {
                 WARN("write() fail: %d", writed);
                 result = 35;
                 goto exit;
             }
             req.sent_to_server += writed;
 #ifdef DUMP
-            LOG_HEXDUMP("SENDED TO SERVER (data)", (unsigned char*)data, data_len);
+            LOG_HEXDUMP("SENDED TO SERVER (data)", (unsigned char*)req.data, req.data_len);
 #else
             DBG("SENDED TO SERVER %d bytes (data)", n);
 #endif
             // clear data
-            free(data);
-            data = NULL;
-            data_len = 0;
+            free(req.data);
+            req.data = NULL;
+            req.data_len = 0;
         }
     }
 
@@ -842,6 +845,9 @@ process_request:
                 /* new http request */
                 INFO("-  process new http request", 0);
                 syslog_request();
+
+                LOG_HEXDUMP("request", (unsigned char*)buffer, n);
+
                 memset(&req, 0, sizeof(req));
                 int req_len = MIN((size_t)n, REQ_SIZE-1);
                 strncpy(request, buffer, req_len);
