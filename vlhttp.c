@@ -52,6 +52,7 @@
 struct thread_data
 {
     int client_fd;
+    int remote_fd;
     FILE *logfile;
     uint32 auth_ip;
     uint32 netmask;
@@ -84,6 +85,8 @@ struct req_t
     char url_port[1024];
     int  sent_to_client;
     int  sent_to_server;
+    char *data;
+    int  data_len;
 };
 struct req_t req;
 
@@ -345,7 +348,9 @@ int remove_header(const char *header)
         if (!(end = strstr(s, "\r\n")))     // get next header
             goto end;                               // bad header!
         next_header = end + 2;
-        memmove(s, next_header, strlen(next_header)+1);
+        int tail_len = strlen(next_header);
+        memmove(s, next_header, tail_len);
+        s[tail_len] = '\0';                 // terminate string
 
         // cleanup tail
         //memset(&req.headers[strlen(req.headers)+1], 0, sizeof(req.headers) - strlen(req.headers)); 
@@ -404,6 +409,9 @@ int parse_hostname()
 int parse_request()
 {
     int result = 0;
+
+    // cleanup req struct
+    memset(&req, 0, sizeof(req));
     if ( sscanf(request, "%31s %1023s %15s", req.method, req.url, req.http_ver) != 3) {
         ERR("sscanf() fail", 0);
         goto end;
@@ -538,33 +546,48 @@ int is_sys_authorized()
 
 
 
-int process_sys_cmd()
+int process_sys_cmd(struct thread_data *td)
 {
+    char buf[4*1024];
+    char *pcur = buf, *end = buf+sizeof(buf)-16;
+    int writed, result = -1;
+    memset(buf, 0, sizeof(buf));
+
     // here reject too
     if (!sys_auth)
         return 0;
+    if ( strcmp("POST", req.method) == 0 ) {
+
+    } else if ( strcmp("GET", req.method) == 0 ) {
+        pcur += snprintf(pcur, end-pcur, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers);
+        pcur += snprintf(pcur, end-pcur, "<html><head><title>syscmd</title></head><body><h1>exec syscmd</h1><form> </form></body></html>");
+        int res_len = strlen(buf);
+        if ((writed = write(td->client_fd, pcur, pcur-buf)) != res_len) {
+            WARN("write() fail: %d", writed);
+            result = 50;
+			goto exit;
+        }
+        req.sent_to_server += writed;
+        result = 0;
+    }
     DBG("cmd: '%s'", req.url_path);
-    return 1;
+exit:
+    return result;
 }
 
 int proxy_thread( struct thread_data *td )
 {
-    int remote_fd = -1;
     int state;
-    int n, client_fd;
+    int n;
 	int result = -1;
-    uint32 client_ip;
     ssize_t writed;
     int already_authorized = 0;
     // if some http data coming together with request
-    char *data = NULL;
-    int data_len = 0;
 
 #define BUF_SIZE 1504
 #define REQ_SIZE 15004
 #define clear_buffer() memset(buffer, 0, BUF_SIZE)
 #define clear_request() memset(request, 0, REQ_SIZE);
-#define clear_req() memset(&req, 0, sizeof(req));
         
     char buffer[BUF_SIZE];
     char last_host[BUF_SIZE];
@@ -580,17 +603,14 @@ int proxy_thread( struct thread_data *td )
 	FENTER;
 	ASSERT(request);
 
-    client_fd = td->client_fd;
-    client_ip = td->client_ip;
-
     /* fetch the http request headers */
     FD_ZERO( &rfds );
-    FD_SET( (unsigned int) client_fd, &rfds );
+    FD_SET( (unsigned int) td->client_fd, &rfds );
 
     timeout.tv_sec  = 15;
     timeout.tv_usec =  0;
 
-    if ( select(client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0) {
+    if ( select(td->client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0) {
 		ERR("select() timeout", 0);
 		result = 11;
         goto exit;
@@ -598,10 +618,9 @@ int proxy_thread( struct thread_data *td )
 
     char *end_of_req = NULL;
     char *preq = request;
-    clear_req();
     clear_request();
     clear_buffer();
-    if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
+    if ( ( n = read(td->client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
         ERR("read() fail", 0);
         result = 12;
         goto exit;
@@ -615,7 +634,7 @@ process_request:
     while ( !(end_of_req = strstr(request, "\r\n\r\n")) ) {
         DBG("-  request without %s", ANSI_WHITE"CRLFCRLF"ANSI_RESET);
         clear_buffer();
-        if ( ( n = read(client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
+        if ( ( n = read(td->client_fd, buffer, sizeof(buffer)-4) ) <= 0 ) {
             ERR("read() fail", 0);
             result = 12;
             goto exit;
@@ -630,17 +649,17 @@ process_request:
     if ( (unsigned int)(end_of_req - request) == strlen(request) ) {
         DBG("no data found in this request", 0);
     } else {
-        data_len = preq - end_of_req;
-        DBG("%d data bytes found in this request", data_len);
-        data = malloc(data_len);
-        if (!data) {
-            ERR("malloc() %d", data_len);
+        req.data_len = preq - end_of_req;
+        DBG("%d data bytes found in this request", req.data_len);
+        req.data = malloc(req.data_len);
+        if (!req.data) {
+            ERR("malloc() %d", req.data_len);
             goto exit;
         }
-        memcpy(data, end_of_req, data_len);
+        memcpy(req.data, end_of_req, req.data_len);
     }
 
-//#define DUMP
+#define DUMP
 #ifdef DUMP
     LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, preq-request);
 #else
@@ -651,7 +670,7 @@ process_request:
         return -1;
     };
 
-    if (!already_authorized) { 
+    if (!already_authorized) {
         if (is_proxy_authorized()) {
             already_authorized = 1;
         } else {
@@ -662,7 +681,7 @@ process_request:
 
     if ( is_syscmd() ) {
         if ( is_sys_authorized() ) {
-            process_sys_cmd();
+            process_sys_cmd(td);
             goto exit;
         } else {
             sys_unauthorized(td);
@@ -684,20 +703,20 @@ process_request:
     }
 
     if ( req.connect ) {
-        if( td->connect == 1 && req.port != 443 ) {
-            result = 20;
-			goto exit;
+        //if( td->connect == 1 && req.port != 443 ) {
+        //    result = 20;
+		//	goto exit;
         }
     }
 
     /* connect to the remote server, if not already connected */
     if ( 1 || strcmp(req.hostname, last_host) ) {
-        shutdown( remote_fd, 2 );
-        close( remote_fd );
+        shutdown( td->remote_fd, 2 );
+        close( td->remote_fd );
 
-        remote_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
+        td->remote_fd = socket( AF_INET, SOCK_STREAM, IPPROTO_IP );
 
-        if (remote_fd < 0) {
+        if (td->remote_fd < 0) {
 			WARN("-  socket() fail", 0);
             result = 21;
 			goto exit;
@@ -710,7 +729,7 @@ process_request:
                 (void *) remote_host->h_addr,
                 remote_host->h_length );
 
-        if ( connect( remote_fd, (struct sockaddr *) &remote_addr, sizeof( remote_addr ) ) < 0 ) {
+        if ( connect( td->remote_fd, (struct sockaddr *) &remote_addr, sizeof( remote_addr ) ) < 0 ) {
 			WARN("-  connect() to '%s:%d' fail", req.hostname, req.port);
             result = 22;
             goto exit;
@@ -727,7 +746,7 @@ process_request:
         /* send HTTP/1.0 200 OK */
         snprintf(buffer, sizeof(buffer), "HTTP/1.0 200 OK\r\n\r\n");
 
-        if ( (writed = write(client_fd, buffer, 19)) != 19 ) {
+        if ( (writed = write(td->client_fd, buffer, 19)) != 19 ) {
             WARN("write() fail: %d", writed);
             result = 23;
 			goto exit;
@@ -746,7 +765,7 @@ process_request:
         }
         memset(server_req, 0, server_req_size);
 		n = snprintf(server_req, server_req_size - 4, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers);
-        if ((writed = write(remote_fd, server_req, n)) != n) {
+        if ((writed = write(td->remote_fd, server_req, n)) != n) {
             WARN("write() fail: %d", writed);
             result = 24;
 			goto exit;
@@ -759,23 +778,23 @@ process_request:
 #endif
         free(server_req);
 
-        if ( data ) {
+        if ( req.data ) {
             // Some additional data was found in initial request
-            if ((writed = write(remote_fd, data, data_len)) != data_len) {
+            if ((writed = write(td->remote_fd, req.data, req.data_len)) != req.data_len) {
                 WARN("write() fail: %d", writed);
                 result = 35;
                 goto exit;
             }
             req.sent_to_server += writed;
 #ifdef DUMP
-            LOG_HEXDUMP("SENDED TO SERVER (data)", (unsigned char*)data, data_len);
+            LOG_HEXDUMP("SENDED TO SERVER (data)", (unsigned char*)req.data, req.data_len);
 #else
             DBG("SENDED TO SERVER %d bytes (data)", n);
 #endif
             // clear data
-            free(data);
-            data = NULL;
-            data_len = 0;
+            free(req.data);
+            req.data = NULL;
+            req.data_len = 0;
         }
     }
 
@@ -786,10 +805,10 @@ process_request:
     while( 1 )
     {
         FD_ZERO( &rfds );
-        FD_SET( (unsigned int) client_fd, &rfds );
-        FD_SET( (unsigned int) remote_fd, &rfds );
+        FD_SET( (unsigned int) td->client_fd, &rfds );
+        FD_SET( (unsigned int) td->remote_fd, &rfds );
     
-        n = ( client_fd > remote_fd ) ? client_fd : remote_fd;
+        n = ( td->client_fd > td->remote_fd ) ? td->client_fd : td->remote_fd;
 
         if ( select( n + 1, &rfds, NULL, NULL, NULL ) < 0 ) {
             ERR("select() fail", 0);
@@ -797,9 +816,9 @@ process_request:
 			goto exit;
         }
 
-        if ( FD_ISSET( remote_fd, &rfds ) ) {
+        if ( FD_ISSET( td->remote_fd, &rfds ) ) {
             clear_buffer();
-            if ( ( n = read( remote_fd, buffer, BUF_SIZE-1) ) <= 0 ) {
+            if ( ( n = read( td->remote_fd, buffer, BUF_SIZE-1) ) <= 0 ) {
                 WARN("read() fail: %d", n);
                 result = 26;
 				goto exit;
@@ -812,7 +831,7 @@ process_request:
 
             state = 1; /* client finished sending data */
 
-            if ( (writed = write( client_fd, buffer, n )) != n ) {
+            if ( (writed = write( td->client_fd, buffer, n )) != n ) {
                 WARN("write() fail: %d", writed);
                 result = 27;
 				goto exit;
@@ -825,9 +844,9 @@ process_request:
 #endif
         }
 
-        if ( FD_ISSET( client_fd, &rfds ) ) {
+        if ( FD_ISSET( td->client_fd, &rfds ) ) {
             clear_buffer();
-            if ( (n = read( client_fd, buffer, BUF_SIZE-1)) <= 0 ) {
+            if ( (n = read( td->client_fd, buffer, BUF_SIZE-1)) <= 0 ) {
                 WARN("read() fail: %d", n);
                 result = 28;
 				goto exit;
@@ -842,6 +861,9 @@ process_request:
                 /* new http request */
                 INFO("-  process new http request", 0);
                 syslog_request();
+
+                LOG_HEXDUMP("request", (unsigned char*)buffer, n);
+
                 memset(&req, 0, sizeof(req));
                 int req_len = MIN((size_t)n, REQ_SIZE-1);
                 strncpy(request, buffer, req_len);
@@ -849,7 +871,7 @@ process_request:
                 goto process_request;
             }
 
-            if ((writed = write( remote_fd, buffer, n)) != n ) {
+            if ((writed = write( td->remote_fd, buffer, n)) != n ) {
                 WARN("write() fail: %d", writed);
                 result = 29;
 				goto exit;
@@ -867,10 +889,10 @@ process_request:
     /* not reached */
 exit:
 
-    shutdown( client_fd, 2 );
-    shutdown( remote_fd, 2 );
-    close( client_fd );
-    close( remote_fd );
+    shutdown( td->client_fd, 2 );
+    shutdown( td->remote_fd, 2 );
+    close( td->client_fd );
+    close( td->remote_fd );
     syslog_request();
     closelog();
 	if (request) free(request);
