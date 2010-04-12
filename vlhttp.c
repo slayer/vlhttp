@@ -85,6 +85,7 @@ struct req_t
     char url_port[1024];
     int  sent_to_client;
     int  sent_to_server;
+    // if some http data coming together with request
     char *data;
     int  data_len;
 };
@@ -281,21 +282,21 @@ void syslog_request(){
 
 void bad_request(struct thread_data *td )
 {
-	char message[]="<html><body><h1>Bad request</h1></body><html>";
-	DBG("write: '%s'", message);
-	req.sent_to_client += write( td->client_fd, message, sizeof(message));
+    char message[]="<html><body><h1>Bad request</h1></body><html>";
+    DBG("write: '%s'", message);
+    req.sent_to_client += write( td->client_fd, message, sizeof(message));
 }
 
 void common_unauthorized(struct thread_data *td, int code)
 {
-	char buf[1024], *pstr = buf;
+    char buf[1024], *pstr = buf;
 
     pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: vlhttp"VERSION"\r\n", code, code == 407 ? "Proxy " : "" );
     pstr += snprintf(pstr, sizeof(buf), "%sAuthenticate: Basic realm=\"%s\"\r\n", code == 407 ? "Proxy-" : "WWW-", proxy_realm);
     pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: vlhttp "VERSION"</body></html>\r\n");
 
-	DBG("SEND TO CLIENT: '%s'", buf);
-	req.sent_to_client += write( td->client_fd, buf, strlen(buf));
+    DBG("SEND TO CLIENT: '%s'", buf);
+    req.sent_to_client += write( td->client_fd, buf, strlen(buf));
 }
 void proxy_unauthorized(struct thread_data *td )
 {
@@ -308,42 +309,42 @@ void sys_unauthorized(struct thread_data *td )
 
 char *get_header(const char *header)
 {
-	char *s;
-	char headname[256];
-	char *result = NULL;
-	char *start = NULL, *end = NULL;
+    char *s;
+    char headname[256];
+    char *result = NULL;
+    char *start = NULL, *end = NULL;
 
-	snprintf(headname, sizeof(headname), "\n%s: ", header);
-	s = strstr(req.headers, headname);
-	if (s) {
-		start = s + strlen(headname); 
-		if ( (end = strchr(start, '\r')) || (end = strchr(start, '\n'))) 
-			result = strndup(start, end-start);
-	}
+    snprintf(headname, sizeof(headname), "\n%s: ", header);
+    s = strstr(req.headers, headname);
+    if (s) {
+        start = s + strlen(headname); 
+        if ( (end = strchr(start, '\r')) || (end = strchr(start, '\n'))) 
+            result = strndup(start, end-start);
+    }
 
-	if ( result ) {
-		DBG("- HEADER found '%s': %s", header, result);
-	} else {
-		DBG("- HEADER '%s' not found", header);
-	}
+    if ( result ) {
+        DBG("- HEADER found '%s': %s", header, result);
+    } else {
+        DBG("- HEADER '%s' not found", header);
+    }
 
-	return result;
+    return result;
 }
 
 int remove_header(const char *header)
 {
-	char *s;
-	char headname[256];
-	int result = 0;
-	char *next_header = NULL, *end = NULL;
+    char *s;
+    char headname[256];
+    int result = 0;
+    char *next_header = NULL, *end = NULL;
     char *end_of_headers = strstr(req.headers, "\r\n\r\n");
 
     if (!end_of_headers)
         goto end;
 
-	snprintf(headname, sizeof(headname)-1, "\n%s: ", header);
-	s = strstr(req.headers, headname);
-	if (s) {
+    snprintf(headname, sizeof(headname)-1, "\n%s: ", header);
+    s = strstr(req.headers, headname);
+    if (s) {
         s++;                                        // cut first \n
         if (!(end = strstr(s, "\r\n")))     // get next header
             goto end;                               // bad header!
@@ -356,22 +357,22 @@ int remove_header(const char *header)
         //memset(&req.headers[strlen(req.headers)+1], 0, sizeof(req.headers) - strlen(req.headers)); 
 
         result = 1;
-	}
+    }
 
-	if ( result ) {
-		//DBG("- HEADER removed '%s'", req.headers);
-	} else {
-		//DBG("- HEADER '%s' not found", req.headers);
-	}
+    if ( result ) {
+        //DBG("- HEADER removed '%s'", req.headers);
+    } else {
+        //DBG("- HEADER '%s' not found", req.headers);
+    }
 
 end:
-	return result;
+    return result;
 }
 
 int add_header(const char* name, const char* value)
 {
-	char *s;
-	int result = 0;
+    char *s;
+    int result = 0;
     char *end_of_headers = strstr(req.headers, "\r\n\r\n");
     if (!end_of_headers)
         goto end;
@@ -391,7 +392,7 @@ int parse_hostname()
 {
     char *host = get_header("Host");
     char *colon;
-    
+
     if (!host) {
         host = strdup(req.url_host);
     }
@@ -410,16 +411,25 @@ int parse_request()
 {
     int result = 0;
 
-    // cleanup req struct
-    memset(&req, 0, sizeof(req));
+    // Cleanup req struct, but save req.data if it non null
+    {
+        char *tmp_data = req.data;
+        int tmp_data_len = req.data_len;
+        // cleanup req struct
+        memset(&req, 0, sizeof(req));
+        if (tmp_data) {
+            req.data = tmp_data;
+            req.data_len = tmp_data_len;
+        }
+    }
     if ( sscanf(request, "%31s %1023s %15s", req.method, req.url, req.http_ver) != 3) {
         ERR("sscanf() fail", 0);
         goto end;
     };
-	DBG("-  method: '%s'", req.method);
-	DBG("-  url: '%s'", req.url);
-	DBG("-  http_ver: '%s'", req.http_ver);
-    
+    DBG("-  method: '%s'", req.method);
+    DBG("-  url: '%s'", req.url);
+    DBG("-  http_ver: '%s'", req.http_ver);
+
     char *headers = strstr(request, "\r\n");
     char *end_of_req = strstr(headers, "\r\n\r\n");
 
@@ -463,11 +473,11 @@ int parse_request()
         goto end;
     }
     result = 1;
-	DBG("-  req.scheme: '%s'", req.scheme);
-	DBG("-  req.url_host: '%s'", req.url_host);
-	DBG("-  req.url_path: '%s'", req.url_path);
-	DBG("-  req.port: '%d'", req.port);
-	DBG("-  req.hostname: '%s'", req.hostname);
+    DBG("-  req.scheme: '%s'", req.scheme);
+    DBG("-  req.url_host: '%s'", req.url_host);
+    DBG("-  req.url_path: '%s'", req.url_path);
+    DBG("-  req.port: '%d'", req.port);
+    DBG("-  req.hostname: '%s'", req.hostname);
 end:
     if (!result) {
         LOG_HEXDUMP("BAD REQUEST", (unsigned char*)request, strlen(request)+1);
@@ -498,7 +508,7 @@ int is_common_authorized(const char* header, const char* userpass64)
     }
 
     req_auth = get_header(header);
-    
+
     if (!req_auth) {
         reason = "header does not exists";
         goto exit;
@@ -557,15 +567,81 @@ int process_sys_cmd(struct thread_data *td)
     if (!sys_auth)
         return 0;
     if ( strcmp("POST", req.method) == 0 ) {
+        if (!req.data) {
+            ERR("req.data is null", 0);
+            goto exit;
+        };
 
+        LOG_HEXDUMP("data", (unsigned char*)req.data, req.data_len);
+
+        char *str_content_len = get_header("Content-Length");
+        int content_len = atoi(str_content_len);
+        DBG("content_len: %d", content_len);
+        if ( content_len <= 0 ) {
+            ERR("Bad Content-Length %s", str_content_len);
+            goto exit;
+        }
+        free(str_content_len);
+
+        if ( req.data_len != content_len ) {
+            ERR("Content-Length mistmatch: %d vs %d", content_len, req.data_len);
+            goto exit;
+        }
+
+        char *cmd = strstr(req.data, "\r\n\r\n");      // to end of post boundary header
+        if (!cmd) {
+            ERR("cannot find start of cmd: '%s'", req.data);
+            goto exit;
+        }
+        cmd += 4;                  // to first byte
+
+        char *end_of_cmd = strstr(cmd, "\r\n");
+        if (!end_of_cmd) {
+            ERR("cannot find end of cmd: '%s'", req.data);
+            goto exit;
+        }
+        end_of_cmd[0] = '\0';
+
+        DBG("cmd: '%s'", cmd);
+
+        // create pipe
+        FILE *f;
+        if ( !(f = popen(cmd, "r")) ) {
+            ERR("popen() fail", 0);
+            goto exit;
+        }
+
+        // send the header
+        snprintf(buf, sizeof(buf)-4, "HTTP/1.0 200 OK\r\nContent-type: text/plain\r\n\r\n");
+        writed = write(td->client_fd, buf, strlen(buf));
+
+        // read pipe and send to client
+        while( fgets(buf, sizeof(buf), f) ) {
+            DBG("popen: %s", buf);
+            writed = write(td->client_fd, buf, strlen(buf));
+        }
+        // destroy the pipe
+        pclose(f);
+
+        free(req.data);
+        req.data = NULL;
+        req.data_len = 0;
+        result = 1;
     } else if ( strcmp("GET", req.method) == 0 ) {
         pcur += snprintf(pcur, end-pcur, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers);
-        pcur += snprintf(pcur, end-pcur, "<html><head><title>syscmd</title></head><body><h1>exec syscmd</h1><form> </form></body></html>");
+        pcur += snprintf(pcur, end-pcur, "<html><head><title>syscmd</title></head>"
+                "<body><h1>exec syscmd</h1>"
+                    "<form method=\"post\" action=\"/exec\" enctype=\"multipart/form-data\">"
+                        "<input type=\"text\" name=\"cmd\" size=\"50\">"
+                        "<input type=\"submit\" value=\"exec\">"
+                    "</form>" 
+                    "</body></html>");
+        //<form ENCTYPE="multipart/form-data" METHOD="post" ACTION="%s">
         int res_len = strlen(buf);
-        if ((writed = write(td->client_fd, pcur, pcur-buf)) != res_len) {
+        if ((writed = write(td->client_fd, buf, pcur-buf)) != res_len) {
             WARN("write() fail: %d", writed);
             result = 50;
-			goto exit;
+            goto exit;
         }
         req.sent_to_server += writed;
         result = 0;
@@ -579,16 +655,15 @@ int proxy_thread( struct thread_data *td )
 {
     int state;
     int n;
-	int result = -1;
+    int result = -1;
     ssize_t writed;
     int already_authorized = 0;
-    // if some http data coming together with request
 
 #define BUF_SIZE 1504
 #define REQ_SIZE 15004
 #define clear_buffer() memset(buffer, 0, BUF_SIZE)
 #define clear_request() memset(request, 0, REQ_SIZE);
-        
+
     char buffer[BUF_SIZE];
     char last_host[BUF_SIZE];
     request = malloc(REQ_SIZE);
@@ -600,8 +675,8 @@ int proxy_thread( struct thread_data *td )
 
     fd_set rfds;
 
-	FENTER;
-	ASSERT(request);
+    FENTER;
+    ASSERT(request);
 
     /* fetch the http request headers */
     FD_ZERO( &rfds );
@@ -611,8 +686,8 @@ int proxy_thread( struct thread_data *td )
     timeout.tv_usec =  0;
 
     if ( select(td->client_fd + 1, &rfds, NULL, NULL, &timeout ) <= 0) {
-		ERR("select() timeout", 0);
-		result = 11;
+        ERR("select() timeout", 0);
+        result = 11;
         goto exit;
     }
 
@@ -665,6 +740,7 @@ process_request:
 #else
     DBG("RECEIVED FROM CLIENT %d bytes", preq-request);
 #endif
+    LOG_HEXDUMP("data", (unsigned char*)req.data, req.data_len);
     if (!parse_request()) {
         WARN("bad request:", request);
         return -1;
@@ -706,7 +782,7 @@ process_request:
         //if( td->connect == 1 && req.port != 443 ) {
         //    result = 20;
 		//	goto exit;
-        }
+        //}
     }
 
     /* connect to the remote server, if not already connected */
