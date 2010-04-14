@@ -567,12 +567,6 @@ int process_sys_cmd(struct thread_data *td)
     if (!sys_auth)
         return 0;
     if ( strcmp("POST", req.method) == 0 ) {
-        if (!req.data) {
-            ERR("req.data is null", 0);
-            goto exit;
-        };
-
-        LOG_HEXDUMP("data", (unsigned char*)req.data, req.data_len);
 
         char *str_content_len = get_header("Content-Length");
         int content_len = atoi(str_content_len);
@@ -582,6 +576,27 @@ int process_sys_cmd(struct thread_data *td)
             goto exit;
         }
         free(str_content_len);
+
+        // if client send only headers, read body of request
+        if ( !req.data || req.data_len < content_len ) {
+            if (!req.data) {
+                if ( !(req.data = malloc(content_len+4)) ) {
+                    ERR("malloc() fail %d", content_len);
+                    goto exit;
+                }
+            }
+
+            while ( req.data_len < content_len ) {
+                int n;
+                if ( ( n = read(td->client_fd, req.data + req.data_len, content_len - req.data_len) ) <= 0 ) {
+                    ERR("read() fail", 0);
+                    goto exit;
+                }
+                DBG("-  recv %d bytes", n);
+                req.data_len += n;
+            }
+        }
+        LOG_HEXDUMP("data", (unsigned char*)req.data, req.data_len);
 
         if ( req.data_len != content_len ) {
             ERR("Content-Length mistmatch: %d vs %d", content_len, req.data_len);
@@ -734,7 +749,7 @@ process_request:
         memcpy(req.data, end_of_req, req.data_len);
     }
 
-#define DUMP
+//#define DUMP
 #ifdef DUMP
     LOG_HEXDUMP("RECEIVED FROM CLIENT", (unsigned char*)request, preq-request);
 #else
