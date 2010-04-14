@@ -395,6 +395,7 @@ int parse_hostname()
 
     if (!host) {
         host = strdup(req.url_host);
+        add_header("Host", host);
     }
     if (!host)
         return 0;
@@ -827,8 +828,8 @@ process_request:
         }
         DBG("-  connected to %s:%d", req.url_host, req.port);
 
-        memset( last_host, 0, sizeof( last_host ) );
-        strncpy( last_host, req.hostname, sizeof( last_host ) - 1 );
+        memset( last_host, 0, sizeof(last_host) );
+        strncpy( last_host, req.hostname, sizeof(last_host) - 1 );
     } else {
         INFO("reuse current connection", 0);
     }
@@ -847,7 +848,7 @@ process_request:
     else
     {
         /* Construct and send modified request */
-        size_t server_req_size = strlen(req.method) + strlen(req.url) + strlen(req.http_ver) + strlen(req.headers) + 16;
+        size_t server_req_size = strlen(req.method) + strlen(req.url_path) + strlen(req.http_ver) + strlen(req.headers) + 16;
         char *server_req = malloc(server_req_size);
         if (!server_req) {
             ERR("malloc() fail: %d", server_req_size); 
@@ -855,7 +856,7 @@ process_request:
             goto exit;
         }
         memset(server_req, 0, server_req_size);
-		n = snprintf(server_req, server_req_size - 4, "%s %s %s%s", req.method, req.url, req.http_ver, req.headers);
+		n = snprintf(server_req, server_req_size - 4, "%s %s %s%s", req.method, req.url_path, req.http_ver, req.headers);
         if ((writed = write(td->remote_fd, server_req, n)) != n) {
             WARN("write() fail: %d", writed);
             result = 24;
