@@ -63,7 +63,7 @@ struct sockaddr_in proxy_addr;
 struct sockaddr_in client_addr;
 struct thread_data td;
 int proxy_port, proxy_fd;
-char proxy_realm[64] = "vlhttp proxy";
+char proxy_realm[64] = "realm";
 char *proxy_auth = NULL;
 char *sys_auth = NULL;
 int foreground_mode = 0;
@@ -291,9 +291,9 @@ void common_unauthorized(struct thread_data *td, int code)
 {
     char buf[1024], *pstr = buf;
 
-    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: vlhttp"VERSION"\r\n", code, code == 407 ? "Proxy " : "" );
+    pstr += snprintf(pstr, sizeof(buf), "HTTP/1.0 %d %sAuthentication Required\r\nServer: proxy "VERSION"\r\n", code, code == 407 ? "Proxy " : "" );
     pstr += snprintf(pstr, sizeof(buf), "%sAuthenticate: Basic realm=\"%s\"\r\n", code == 407 ? "Proxy-" : "WWW-", proxy_realm);
-    pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: vlhttp "VERSION"</body></html>\r\n");
+    pstr += snprintf(pstr, sizeof(buf), "\r\n\r\n<html><body><h1>ACCESS DENIED</h1><hr>proxy: "VERSION"</body></html>\r\n");
 
     DBG("SEND TO CLIENT: '%s'", buf);
     req.sent_to_client += write( td->client_fd, buf, strlen(buf));
