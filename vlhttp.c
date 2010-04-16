@@ -795,10 +795,10 @@ process_request:
     }
 
     if ( req.connect ) {
-        //if( td->connect == 1 && req.port != 443 ) {
-        //    result = 20;
-		//	goto exit;
-        //}
+        if( td->connect == 1 && req.port != 443 ) {
+            result = 20;
+			goto exit;
+        }
     }
 
     /* connect to the remote server, if not already connected */
